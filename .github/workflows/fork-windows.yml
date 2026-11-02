@@ -1,4 +1,4 @@
-name: Fork Windows build
+name: Latest validation Windows build
 
 # WhiteWh/zerus only; not part of upstream Zerus. Builds and tests the Windows
 # portable zip of the current whitewh/main after waiting for the build slot,
@@ -9,8 +9,8 @@ name: Fork Windows build
 # feed, and no updater in its desktop app.
 on:
   push:
-    branches: [whitewh/main]
-    tags: ['whitewh-exp-*']
+    branches: [ci/latest-validation]
+    paths-ignore: [.github/latest-queue-probe]
   workflow_dispatch:
 
 permissions:
@@ -23,11 +23,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate the workflow with the project's pinned actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          lint_dir=$(mktemp -d)
+          cd "$lint_dir"
+          curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_checksums.txt
+          sha256sum --check --ignore-missing actionlint_1.7.12_checksums.txt
+          tar xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+          cd "$GITHUB_WORKSPACE"
+          "$lint_dir/actionlint" .github/workflows/fork-windows.yml .github/workflows/latest-queue-probe.yml
   windows:
+    needs: lint
     name: Windows portable zip and release
     if: >-
-      github.repository == 'WhiteWh/zerus' &&
-      (github.ref == 'refs/heads/whitewh/main' || startsWith(github.ref, 'refs/tags/whitewh-exp-'))
+      github.repository == 'Phoenix-/zerus' && github.ref == 'refs/heads/ci/latest-validation'
     runs-on: windows-2025
     timeout-minutes: 150
     permissions:
@@ -45,7 +64,7 @@ jobs:
       # Embedded in hgs-tray: the build the updater compares and the feed it reads.
       # Empty for an experimental build, so it neither updates nor gets updated.
       ZERUS_FORK_BUILD: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.run_number || '' }}
-      ZERUS_FORK_FEED_URL: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
+      ZERUS_FORK_FEED_URL: ''
     steps:
       - name: Check out text files unchanged
         run: git config --global core.autocrlf false
@@ -53,7 +72,7 @@ jobs:
         with:
           # Resolve the release branch only after this run gets its slot.
           # Experimental tags keep the exact commit that triggered the run.
-          ref: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.sha || 'refs/heads/whitewh/main' }}
+          ref: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.sha || 'refs/heads/ci/latest-validation' }}
           persist-credentials: false
       - name: Record the checked-out source
         id: source
@@ -174,7 +193,7 @@ jobs:
           zip = pathlib.Path("artifacts/zerus-windows-x86_64.zip")
           build = int(os.environ["BUILD"])
           feed = {"schema": 1, "build": build, "commit": os.environ["COMMIT"],
-                  "url": f"https://github.com/WhiteWh/zerus/releases/download/whitewh-{build}/{zip.name}",
+                  "url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/latest-validation-{build}/{zip.name}",
                   "size": zip.stat().st_size, "sha256": hashlib.sha256(zip.read_bytes()).hexdigest()}
           pathlib.Path("artifacts/zerus-fork-feed.json").write_text(json.dumps(feed, indent=2) + "\n")
           print(json.dumps(feed, indent=2))
@@ -186,10 +205,10 @@ jobs:
           BUILD: ${{ github.run_number }}
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          gh release create "whitewh-$BUILD" artifacts/zerus-windows-x86_64.zip artifacts/zerus-fork-feed.json \
-            --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --latest \
-            --title "Zerus fork build $BUILD" \
-            --notes "Windows portable build $BUILD of whitewh/main at $COMMIT. Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
+          gh release create "latest-validation-$BUILD" artifacts/zerus-windows-x86_64.zip artifacts/zerus-fork-feed.json \
+            --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --prerelease --latest=false \
+            --title "Latest validation build $BUILD" \
+            --notes "Isolated Windows validation of ci/latest-validation at $COMMIT. No automatic update feed is embedded."
       - name: Publish the experimental prerelease
         if: env.EXPERIMENTAL == 'true'
         env:

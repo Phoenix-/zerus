@@ -1,0 +1,50 @@
+name: Latest queue probe
+
+on:
+  push:
+    branches: [ci/latest-validation]
+    paths: [.github/latest-queue-probe]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows
+  cancel-in-progress: false
+
+jobs:
+  source:
+    if: github.repository == 'Phoenix-/zerus'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/ci/latest-validation
+          persist-credentials: false
+      - name: Record the checked-out source
+        id: source
+        shell: bash
+        env:
+          TRIGGER_COMMIT: ${{ github.sha }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Source commit: $commit (trigger: $GITHUB_SHA)" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          record = {
+              "trigger_commit": os.environ["TRIGGER_COMMIT"],
+              "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "marker": pathlib.Path(".github/latest-queue-probe").read_text().strip(),
+          }
+          pathlib.Path("queue-evidence.json").write_text(json.dumps(record, indent=2) + "\n")
+          print(json.dumps(record, indent=2))
+          assert record["source_commit"] != record["trigger_commit"], "Expected a newer HEAD after waiting"
+          assert record["marker"] == "head-arrived-while-pending", "Expected queued branch update"
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: latest-queue-evidence
+          path: queue-evidence.json
+          retention-days: 7
