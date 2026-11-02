@@ -15,6 +15,17 @@ manual dispatch, only in `WhiteWh/zerus`. On a standard `windows-2025` runner it
 4. publishes release `whitewh-<run number>` with `zerus-windows-x86_64.zip` and
    `zerus-fork-feed.json`, marked as the latest release.
 
+The workflow keeps one running build and one pending run (GitHub's default
+`queue: single`, with `cancel-in-progress: false`). The `queue` key is omitted for
+compatibility with the pinned actionlint version. New pushes replace the pending
+run without stopping the running build. The slot covers both building and
+publishing. After acquiring it, a regular run checks out the current head of
+`whitewh/main`, including commits
+that arrived while it waited. That checked-out SHA, not the triggering event's
+SHA, identifies the package, update feed and release target. The run summary
+records both SHAs. Manual runs are accepted only from `whitewh/main` or an
+experimental tag.
+
 A failing step publishes nothing. The run number is embedded in `hgs-tray.exe` as
 `ZERUS_FORK_BUILD`, together with the feed address `ZERUS_FORK_FEED_URL`; CMake
 accepts only release assets of `WhiteWh/zerus` for the latter.
