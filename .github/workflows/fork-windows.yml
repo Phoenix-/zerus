@@ -1,8 +1,9 @@
 name: Fork Windows build
 
 # WhiteWh/zerus only; not part of upstream Zerus. Builds and tests the Windows
-# portable zip of whitewh/main, then publishes it with its update feed as a
-# release of this fork. The fork's desktop updater installs those releases
+# portable zip of the current whitewh/main after waiting for the build slot,
+# then publishes it with its update feed as a release of this fork.
+# The fork's desktop updater installs those releases
 # (docs/fork-updates.md). A pushed tag whitewh-exp-* builds that commit the same
 # way and publishes an experimental prerelease: never the latest release, no
 # feed, and no updater in its desktop app.
@@ -17,12 +18,16 @@ permissions:
 
 concurrency:
   group: fork-windows
+  # GitHub's default is queue: single; actionlint 1.7.12 cannot parse that key.
+  # Keep the running build and replace only the pending run on newer pushes.
   cancel-in-progress: false
 
 jobs:
   windows:
     name: Windows portable zip and release
-    if: github.repository == 'WhiteWh/zerus'
+    if: >-
+      github.repository == 'WhiteWh/zerus' &&
+      (github.ref == 'refs/heads/whitewh/main' || startsWith(github.ref, 'refs/tags/whitewh-exp-'))
     runs-on: windows-2025
     timeout-minutes: 150
     permissions:
@@ -46,7 +51,16 @@ jobs:
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Resolve the release branch only after this run gets its slot.
+          # Experimental tags keep the exact commit that triggered the run.
+          ref: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.sha || 'refs/heads/whitewh/main' }}
           persist-credentials: false
+      - name: Record the checked-out source
+        id: source
+        run: |
+          commit=$(git rev-parse HEAD)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Source commit: $commit (trigger: $GITHUB_SHA)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13.15'
@@ -153,7 +167,7 @@ jobs:
         if: env.EXPERIMENTAL != 'true'
         env:
           BUILD: ${{ github.run_number }}
-          COMMIT: ${{ github.sha }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           python - <<'EOF'
           import hashlib, json, os, pathlib
@@ -170,18 +184,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD: ${{ github.run_number }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           gh release create "whitewh-$BUILD" artifacts/zerus-windows-x86_64.zip artifacts/zerus-fork-feed.json \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --latest \
             --title "Zerus fork build $BUILD" \
-            --notes "Windows portable build $BUILD of whitewh/main at $GITHUB_SHA. Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
+            --notes "Windows portable build $BUILD of whitewh/main at $COMMIT. Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
       - name: Publish the experimental prerelease
         if: env.EXPERIMENTAL == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          gh release create "$TAG" artifacts/zerus-windows-x86_64.zip             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false             --title "Zerus fork experimental $TAG"             --notes "Experimental Windows portable build of $GITHUB_SHA (tag $TAG). Not the latest release and not offered by the fork updater; this build does not update itself. Install it by hand (docs/fork-updates.md)."
+          gh release create "$TAG" artifacts/zerus-windows-x86_64.zip             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --latest=false             --title "Zerus fork experimental $TAG"             --notes "Experimental Windows portable build of $COMMIT (tag $TAG). Not the latest release and not offered by the fork updater; this build does not update itself. Install it by hand (docs/fork-updates.md)."
       - name: Retain test logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
