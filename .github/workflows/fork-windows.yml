@@ -1,10 +1,10 @@
 name: Fork Windows build
 
-# WhiteWh/zerus only; not part of upstream Zerus. Builds and tests the Windows
-# portable zip of the current whitewh/main after waiting for the build slot,
-# then publishes it with its update feed as a release of this fork.
-# The fork's desktop updater installs those releases
-# (docs/fork-updates.md). A pushed tag whitewh-exp-* builds that commit the same
+# WhiteWh/zerus and Phoenix-/zerus only; not part of upstream Zerus. Builds and
+# tests the current whitewh/main after waiting for the build slot, then publishes
+# its Windows portable zip. WhiteWh releases include their automatic update feed;
+# Phoenix releases are installed manually (docs/fork-updates.md).
+# A pushed tag whitewh-exp-* builds that commit the same
 # way and publishes an experimental prerelease: never the latest release, no
 # feed, and no updater in its desktop app.
 on:
@@ -26,7 +26,7 @@ jobs:
   windows:
     name: Windows portable zip and release
     if: >-
-      github.repository == 'WhiteWh/zerus' &&
+      (github.repository == 'WhiteWh/zerus' || github.repository == 'Phoenix-/zerus') &&
       (github.ref == 'refs/heads/whitewh/main' || startsWith(github.ref, 'refs/tags/whitewh-exp-'))
     runs-on: windows-2025
     timeout-minutes: 150
@@ -42,10 +42,12 @@ jobs:
       CCACHE_DEPEND: 1
       CCACHE_MAXSIZE: 500M
       EXPERIMENTAL: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') }}
+      FORK_RELEASE_PREFIX: ${{ github.repository == 'Phoenix-/zerus' && 'phoenix' || 'whitewh' }}
       # Embedded in hgs-tray: the build the updater compares and the feed it reads.
       # Empty for an experimental build, so it neither updates nor gets updated.
       ZERUS_FORK_BUILD: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.run_number || '' }}
-      ZERUS_FORK_FEED_URL: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
+      # Phoenix releases are installed by hand and never embed an automatic feed.
+      ZERUS_FORK_FEED_URL: ${{ github.repository == 'WhiteWh/zerus' && !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
     steps:
       - name: Check out text files unchanged
         run: git config --global core.autocrlf false
@@ -164,7 +166,7 @@ jobs:
       # Schema 1 of docs/fork-updates.md: the updater installs `url` only when its
       # size and SHA-256 match and the zip's build-info.json names `commit`.
       - name: Update feed
-        if: env.EXPERIMENTAL != 'true'
+        if: github.repository == 'WhiteWh/zerus' && env.EXPERIMENTAL != 'true'
         env:
           BUILD: ${{ github.run_number }}
           COMMIT: ${{ steps.source.outputs.commit }}
@@ -186,10 +188,18 @@ jobs:
           BUILD: ${{ github.run_number }}
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
-          gh release create "whitewh-$BUILD" artifacts/zerus-windows-x86_64.zip artifacts/zerus-fork-feed.json \
+          assets=(artifacts/zerus-windows-x86_64.zip)
+          notes="Windows portable build $BUILD of whitewh/main at $COMMIT."
+          if [ "$GITHUB_REPOSITORY" = 'WhiteWh/zerus' ]; then
+            assets+=(artifacts/zerus-fork-feed.json)
+            notes="$notes Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
+          else
+            notes="$notes Download the ZIP and install it manually. Automatic updates are disabled."
+          fi
+          gh release create "$FORK_RELEASE_PREFIX-$BUILD" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --latest \
             --title "Zerus fork build $BUILD" \
-            --notes "Windows portable build $BUILD of whitewh/main at $COMMIT. Installed automatically by fork builds of Zerus (docs/fork-updates.md)."
+            --notes "$notes"
       - name: Publish the experimental prerelease
         if: env.EXPERIMENTAL == 'true'
         env:

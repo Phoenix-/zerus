@@ -5,8 +5,8 @@ upstream Zerus; the branch `whitewh/main` carries it on top of upstream `main`.
 
 ## Builds
 
-`.github/workflows/fork-windows.yml` runs on every push to `whitewh/main` and on
-manual dispatch, only in `WhiteWh/zerus`. On a standard `windows-2025` runner it:
+In `WhiteWh/zerus`, `.github/workflows/fork-windows.yml` runs on every push to
+`whitewh/main` and on manual dispatch. On a standard `windows-2025` runner it:
 
 1. runs the Rust tests and builds the release `hgs.exe`;
 2. builds the desktop app with the pinned Qt 6.10.3 and runs its offscreen Qt suites;
@@ -29,6 +29,21 @@ experimental tag.
 A failing step publishes nothing. The run number is embedded in `hgs-tray.exe` as
 `ZERUS_FORK_BUILD`, together with the feed address `ZERUS_FORK_FEED_URL`; CMake
 accepts only release assets of `WhiteWh/zerus` for the latter.
+
+### Phoenix Latest builds
+
+The same workflow also runs in `Phoenix-/zerus` on pushes to `whitewh/main` and
+manual dispatch from that branch. It uses the same single-pending queue, current
+branch-head checkout, build, test and portable package checks. A successful run
+publishes a distinct `phoenix-<run number>` release in `Phoenix-/zerus`, marked as
+that repository's latest release. Download its `zerus-windows-x86_64.zip` and
+install it manually.
+
+Phoenix builds embed no automatic update feed and publish no `zerus-fork-feed.json`.
+They do not enable automatic updates from either fork. WhiteWh releases retain
+their existing update feed and `whitewh-<run number>` identity.
+
+### Experimental builds
 
 An experimental build of any commit: push a tag `whitewh-exp-<name>` for it. The
 same workflow builds, tests and packages that commit and publishes the zip as a
