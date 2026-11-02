@@ -1,9 +1,9 @@
 name: Fork Windows build
 
 # WhiteWh/zerus and Phoenix-/zerus only; not part of upstream Zerus. Builds and
-# tests the current whitewh/main after waiting for the build slot, then publishes
-# its Windows portable zip. WhiteWh releases include their automatic update feed;
-# Phoenix releases are installed manually (docs/fork-updates.md).
+# refreshes the single prerelease `latest` on branch pushes. Numbered releases
+# are created only through manual dispatch. Latest has no automatic update feed;
+# manual WhiteWh releases retain their existing feed (docs/fork-updates.md).
 # A pushed tag whitewh-exp-* builds that commit the same
 # way and publishes an experimental prerelease: never the latest release, no
 # feed, and no updater in its desktop app.
@@ -12,6 +12,12 @@ on:
     branches: [whitewh/main]
     tags: ['whitewh-exp-*']
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Numbered release or refresh the rolling Latest prerelease
+        type: choice
+        options: [numbered, latest]
+        default: numbered
 
 permissions:
   contents: read
@@ -42,20 +48,21 @@ jobs:
       CCACHE_DEPEND: 1
       CCACHE_MAXSIZE: 500M
       EXPERIMENTAL: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') }}
+      LATEST_BUILD: ${{ github.ref == 'refs/heads/whitewh/main' && (github.event_name == 'push' || inputs.channel == 'latest') }}
       FORK_RELEASE_PREFIX: ${{ github.repository == 'Phoenix-/zerus' && 'phoenix' || 'whitewh' }}
       # Embedded in hgs-tray: the build the updater compares and the feed it reads.
       # Empty for an experimental build, so it neither updates nor gets updated.
       ZERUS_FORK_BUILD: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.run_number || '' }}
-      # Phoenix releases are installed by hand and never embed an automatic feed.
-      ZERUS_FORK_FEED_URL: ${{ github.repository == 'WhiteWh/zerus' && !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
+      # Only a manually requested numbered WhiteWh release uses the stable feed.
+      ZERUS_FORK_FEED_URL: ${{ github.repository == 'WhiteWh/zerus' && github.event_name == 'workflow_dispatch' && inputs.channel != 'latest' && !startsWith(github.ref, 'refs/tags/whitewh-exp-') && 'https://github.com/WhiteWh/zerus/releases/latest/download/zerus-fork-feed.json' || '' }}
     steps:
       - name: Check out text files unchanged
         run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Resolve the release branch only after this run gets its slot.
-          # Experimental tags keep the exact commit that triggered the run.
-          ref: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') && github.sha || 'refs/heads/whitewh/main' }}
+          # Latest resolves the current branch only after getting its slot.
+          # Manual numbered releases and experimental tags keep their event SHA.
+          ref: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && (github.event_name == 'push' || inputs.channel == 'latest') && 'refs/heads/whitewh/main' || github.sha }}
           persist-credentials: false
       - name: Record the checked-out source
         id: source
@@ -66,6 +73,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13.15'
+      - name: Latest publication contract tests
+        run: python -m unittest discover -s tests -p test_fork_latest_publication.py
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Rust cache identity
         id: rust
@@ -163,10 +172,19 @@ jobs:
             --conpty "$RUNNER_TEMP/conpty" --output artifacts/zerus-windows-x86_64.zip </dev/null 2>&1 | tee artifacts/test-results/package.log
           python scripts/check-windows-portable.py artifacts/zerus-windows-x86_64.zip --run --selftest \
             </dev/null 2>&1 | tee artifacts/test-results/portable.log
+      - name: Refresh rolling Latest prerelease
+        if: env.LATEST_BUILD == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.source.outputs.commit }}
+        run: |
+          python scripts/publish-fork-latest.py --repository "$GITHUB_REPOSITORY" \
+            --commit "$COMMIT" --run-id "$GITHUB_RUN_ID" \
+            --zip artifacts/zerus-windows-x86_64.zip
       # Schema 1 of docs/fork-updates.md: the updater installs `url` only when its
       # size and SHA-256 match and the zip's build-info.json names `commit`.
       - name: Update feed
-        if: github.repository == 'WhiteWh/zerus' && env.EXPERIMENTAL != 'true'
+        if: github.repository == 'WhiteWh/zerus' && env.EXPERIMENTAL != 'true' && env.LATEST_BUILD != 'true'
         env:
           BUILD: ${{ github.run_number }}
           COMMIT: ${{ steps.source.outputs.commit }}
@@ -182,7 +200,7 @@ jobs:
           print(json.dumps(feed, indent=2))
           EOF
       - name: Publish the fork release
-        if: env.EXPERIMENTAL != 'true'
+        if: env.EXPERIMENTAL != 'true' && env.LATEST_BUILD != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           BUILD: ${{ github.run_number }}
