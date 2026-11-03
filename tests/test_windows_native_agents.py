@@ -1129,6 +1129,39 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
                 elif selection.get("approve_for_me"):
                     self.assertIn("codex --approve-for-me", planned.stdout)
 
+    def test_native_subagent_keeps_the_parent_transcript_and_accepts_more_input(self):
+        name = self.launch("child", self.NO_HOOK_REVIEW, "--enable", "multi_agent")
+        self.deliver(name, "Parent fixture before spawning.")
+        parent = self.record(name)
+        self.assertTrue(parent.get("conversation_id"), self.describe())
+        self.assertTrue(parent.get("transcript"), self.describe())
+        self.deliver(name, api.CODEX_SUBAGENT)
+        outputs = [result for entry in api.requests(self.api_root) if entry.get("prompt") == api.CODEX_SUBAGENT
+                   for result in entry.get("results") or []]
+        self.assertFalse(any(isinstance(result, str) and result.startswith(
+            ("unsupported call:", "failed to parse function arguments:")) for result in outputs), outputs)
+
+        def child_finished():
+            record = self.record(name)
+            for key in ("conversation_id", "transcript", "run_id", "pid"):
+                self.assertEqual(record.get(key), parent[key], key)
+            children = record.get("subagents") or {}
+            return next(((sid, child) for sid, child in children.items()
+                         if child.get("state") == "finished" and not child.get("external")), None)
+
+        sid, child = self.until("the native child's separate result", child_finished)
+        self.assertEqual(child["detail"], api.REPLY)
+        paths = list((self.agent_home / "sessions").rglob(f"*{sid}.jsonl"))
+        self.assertEqual(len(paths), 1)
+        with paths[0].open(encoding="utf-8") as transcript:
+            meta = json.loads(transcript.readline())["payload"]
+        self.assertIn("subagent", meta["source"])
+        self.assertEqual(meta["parent_thread_id"], parent["conversation_id"])
+        self.deliver(name, "Parent fixture after spawning.")
+        self.assertEqual(self.record(name)["conversation_id"], parent["conversation_id"])
+        for text in ("Parent fixture before spawning.", api.CODEX_SUBAGENT, "Parent fixture after spawning."):
+            self.assertEqual(self.accepted(name, text, parent["conversation_id"]), 1)
+
     def transcript_rows(self, conversation_id):
         # After a switch the conversation lives in the new account's store; the
         # old account keeps only its own copy of the same rows.
@@ -1235,6 +1268,62 @@ class NativeWindowsCodex(NativeAgent, host.HostCase):
         self.assertEqual(self.accepted(name, MESSAGES[0]), 1, self.describe())
         events = [event["type"] for event in self.inspect(name)["events"]]
         self.assertTrue({"SessionStart", "UserPromptSubmit", "Stop"} <= set(events), events)
+
+    def tool_approval_fixture(self, automatic):
+        # Escalation goes straight to the permission flow, without setting up
+        # or executing inside a Windows sandbox. Nothing uses a real reviewer
+        # account: the automatic case exercises Codex's documented allow hook.
+        self.ARGS = ()
+        config = self.agent_home / "config.toml"
+        config.write_text(config.read_text(encoding="utf-8")
+                          .replace('approval_policy = "never"', 'approval_policy = "on-request"')
+                          .replace('sandbox_mode = "danger-full-access"', 'sandbox_mode = "read-only"'),
+                          encoding="utf-8")
+        if automatic:
+            decision = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                        "decision": {"behavior": "allow"}}})
+            # Leave time for listing polls while the native approval decision
+            # is still automatic and its tracking hook has already arrived.
+            command = "Start-Sleep -Seconds 2; Write-Output '" + decision + "'"
+            (self.agent_home / "hooks.json").write_text(json.dumps({"hooks": {"PermissionRequest": [
+                {"hooks": [{"type": "command", "commandWindows": command, "command": command}]}]}}),
+                encoding="utf-8")
+        name = self.launch("tool-auto" if automatic else "tool-manual", self.NO_HOOK_REVIEW)
+        self.send(name, self.message(self.ready(name), api.CODEX_ESCALATION))
+        if automatic:
+            def started_without_attention():
+                view = self.row(name)
+                self.assertNotEqual(view["phase"], "approval", view)
+                return (self.project / api.CODEX_STARTED).is_file()
+            self.until("automatic approval without a human-attention phase", started_without_attention)
+        return name
+
+    def check_continuing_permission(self, name):
+        self.until("the approved native command to start", lambda: (self.project / api.CODEX_STARTED).is_file())
+        # Codex sent PermissionRequest but has not sent PostToolUse. Waiting
+        # for the command to finish would leave a false approval toast up.
+        record = self.record(name)
+        self.assertEqual(record["phase"], "approval", self.describe())
+        self.assertTrue(any(event["type"] == "PermissionRequest" for event in self.inspect(name)["events"]))
+        for _ in range(3):
+            for view in (self.row(name), self.inspect(name)):
+                self.assertEqual(view["phase"], "tool", view)
+                self.assertEqual(view["session_state"], "working", view)
+            time.sleep(0.1)
+        (self.project / api.CODEX_RELEASE).touch()
+        self.until("the approved command's turn to finish", lambda: self.turn_ended(name, 0))
+
+    def test_a_hook_allowed_codex_command_does_not_request_human_approval(self):
+        self.check_continuing_permission(self.tool_approval_fixture(automatic=True))
+
+    def test_a_codex_terminal_approval_clears_before_the_command_finishes(self):
+        name = self.tool_approval_fixture(automatic=False)
+        self.until("the native permission chooser", lambda: "Would you like to run the following command?" in self.capture(name))
+        for view in (self.row(name), self.inspect(name)):
+            self.assertEqual((view["phase"], view["session_state"]), ("approval", "user"), view)
+        self.assertFalse((self.project / api.CODEX_STARTED).exists())
+        self.keys(name, {"named": "Enter"})
+        self.check_continuing_permission(name)
 
     def test_clear_context_starts_a_new_conversation_in_the_same_agent(self):
         name = self.launch("clear", self.NO_HOOK_REVIEW)
