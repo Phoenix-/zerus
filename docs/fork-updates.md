@@ -19,6 +19,8 @@ Keep each upstream PR separate from the accumulated Phoenix integration branch.
 The initial integration includes WhiteWh PRs #22 (rolling Latest), #23 (Codex
 approval attention), #24 (Codex subagent transcripts) and #25 (Windows CI
 stabilization). Their source branches remain available for upstream review.
+The previous Phoenix `whitewh/main` head is retained as
+`archive/phoenix-whitewh-main-20261103` for recovery.
 
 ## WhiteWh fork additions
 
