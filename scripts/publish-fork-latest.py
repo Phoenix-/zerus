@@ -14,7 +14,7 @@ from windows_portable import inspect
 TAG = "latest"
 ASSET = "zerus-windows-x86_64.zip"
 BACKUP = ASSET + ".previous"
-REPOSITORIES = {"WhiteWh/zerus", "Phoenix-/zerus"}
+REPOSITORIES = {"WhiteWh/zerus": "whitewh/main", "Phoenix-/zerus": "Phoenix/main"}
 
 
 def require(condition, message):
@@ -120,7 +120,7 @@ def publish(client, archive, commit, run_id):
     require(inspect(archive)["source_commit"] == commit, "ZIP belongs to another source commit.")
     expected = digest(archive)
     staged = ASSET + "." + expected.removeprefix("sha256:")[:16] + ".upload"
-    notes = (f"Rolling Windows build of `whitewh/main` at `{commit}`.\n\n"
+    notes = (f"Rolling Windows build of `{REPOSITORIES[client.repository]}` at `{commit}`.\n\n"
              f"[Build and test run](https://github.com/{client.repository}/actions/runs/{run_id}). "
              "Download the ZIP and install it manually. Automatic updates are disabled.\n\n"
              f"SHA-256: `{expected.removeprefix('sha256:')}`\n")

@@ -100,6 +100,15 @@ class LatestPublication(unittest.TestCase):
         self.assertEqual(self.canonical()["digest"], latest.digest(self.second))
         self.assertFalse(self.client.current["draft"])
         self.assertTrue(self.client.current["prerelease"])
+        for repository, branch in (("WhiteWh/zerus", "whitewh/main"), ("Phoenix-/zerus", "Phoenix/main")):
+            with self.subTest(repository=repository):
+                self.client.repository = repository
+                self.publish(self.second, "b" * 40)
+                self.assertIn(f"Rolling Windows build of `{branch}` at `{'b' * 40}`.",
+                              self.client.current["body"])
+                self.assertIn(f"https://github.com/{repository}/actions/runs/123", self.client.current["body"])
+                self.assertEqual(self.client.created, 1)
+                self.assertEqual(self.canonical()["digest"], latest.digest(self.second))
 
     def test_upload_failure_keeps_the_previous_canonical_asset_and_tag(self):
         self.publish()

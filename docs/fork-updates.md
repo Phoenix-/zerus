@@ -48,6 +48,11 @@ Download it from `/releases/tag/latest` or use the stable asset URL
 This prerelease is separate from GitHub's latest stable release and carries no
 automatic update feed.
 
+The rolling release is updated in place, so GitHub may still show its original
+publication date. Use its source commit, linked build run and ZIP asset timestamp
+to identify the current build. Open `/releases/tag/latest` for this prerelease;
+GitHub's `/releases/latest` URL continues to select the numbered stable release.
+
 The workflow keeps one running build and one pending run (GitHub's default
 `queue: single`, with `cancel-in-progress: false`). The `queue` key is omitted for
 compatibility with the pinned actionlint version. New pushes replace the pending
