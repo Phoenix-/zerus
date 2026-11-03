@@ -193,11 +193,12 @@ class WorkflowChannels(unittest.TestCase):
             })
 
         for repository in ("WhiteWh/zerus", "Phoenix-/zerus"):
+            branch = "refs/heads/Phoenix/main" if repository == "Phoenix-/zerus" else "refs/heads/whitewh/main"
             for event, channel, ref, expected in (
-                ("push", "", "refs/heads/whitewh/main", "latest"),
-                ("workflow_dispatch", "numbered", "refs/heads/whitewh/main", "numbered"),
-                ("workflow_dispatch", "", "refs/heads/whitewh/main", "numbered"),
-                ("workflow_dispatch", "latest", "refs/heads/whitewh/main", "latest"),
+                ("push", "", branch, "latest"),
+                ("workflow_dispatch", "numbered", branch, "numbered"),
+                ("workflow_dispatch", "", branch, "numbered"),
+                ("workflow_dispatch", "latest", branch, "latest"),
                 ("push", "", "refs/tags/whitewh-exp-fixture", "experimental"),
             ):
                 with self.subTest(repository=repository, event=event, channel=channel, ref=ref):
@@ -208,7 +209,7 @@ class WorkflowChannels(unittest.TestCase):
                         expression = re.search(r"(?m)^      " + name + r": (.*)$", workflow)[1]
                         values[name] = "true" if run(expression) else "false"
                     source = re.search(r"(?m)^          ref: (.*)$", workflow)[1]
-                    self.assertEqual(run(source), "refs/heads/whitewh/main" if expected == "latest" else "a" * 40)
+                    self.assertEqual(run(source), branch if expected == "latest" else "a" * 40)
                     feed = re.search(r"(?m)^      ZERUS_FORK_FEED_URL: (.*)$", workflow)[1]
                     self.assertEqual(bool(run(feed)), repository == "WhiteWh/zerus" and expected == "numbered")
                     selected = []
@@ -219,6 +220,18 @@ class WorkflowChannels(unittest.TestCase):
                         if run(re.search(r"(?m)^        if: (.*)$", step)[1]):
                             selected.append(label)
                     self.assertEqual(selected, [expected])
+
+        admission = re.search(r"(?ms)^    if: >-\n(.*?)^    runs-on:", workflow)[1]
+        admission = " ".join(admission.split())
+        for repository in ("WhiteWh/zerus", "Phoenix-/zerus", "example/zerus"):
+            for ref in ("refs/heads/whitewh/main", "refs/heads/Phoenix/main",
+                        "refs/heads/main", "refs/heads/feature", "refs/tags/whitewh-exp-fixture"):
+                expected = ((repository, ref) in (
+                    ("WhiteWh/zerus", "refs/heads/whitewh/main"),
+                    ("Phoenix-/zerus", "refs/heads/Phoenix/main")) or
+                    (repository in ("WhiteWh/zerus", "Phoenix-/zerus") and ref.startswith("refs/tags/whitewh-exp-")))
+                with self.subTest(repository=repository, ref=ref):
+                    self.assertEqual(bool(evaluate(admission, repository, "push", ref, "", {})), expected)
 
 
 if __name__ == "__main__":

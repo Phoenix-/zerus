@@ -1,12 +1,35 @@
-# Fork builds and updates (WhiteWh/zerus)
+# Fork builds and updates
 
-This fork adds a Windows portable build with self-update. None of this is part of
-upstream Zerus; the branch `whitewh/main` carries it on top of upstream `main`.
+## Phoenix branch layout
+
+`Phoenix-/zerus` uses `Phoenix/main` as its default and integration branch. It
+contains the current `WhiteWh/zerus:whitewh/main` plus Phoenix changes awaiting
+upstream acceptance. `whitewh/main` in the Phoenix fork is an exact upstream
+mirror; do not merge Phoenix changes into it. `main` continues to mirror the
+original upstream's branch.
+
+To update through the GitHub website, sync `whitewh/main` from WhiteWh, then
+open a pull request inside `Phoenix-/zerus` with base `Phoenix/main` and compare
+`whitewh/main`. Merge with **Create a merge commit** to retain upstream ancestry.
+Resolve integration conflicts in a separate branch so the mirror stays clean.
+Develop new changes on topic branches from the appropriate upstream base for
+their intended PR, then merge those branches into `Phoenix/main` for local use.
+Keep each upstream PR separate from the accumulated Phoenix integration branch.
+
+The initial integration includes WhiteWh PRs #22 (rolling Latest), #23 (Codex
+approval attention), #24 (Codex subagent transcripts) and #25 (Windows CI
+stabilization). Their source branches remain available for upstream review.
+
+## WhiteWh fork additions
+
+WhiteWh adds a Windows portable build with self-update. None of this is part of
+upstream Zerus; its `whitewh/main` carries it on top of upstream `main`.
 
 ## Builds
 
-In `WhiteWh/zerus`, `.github/workflows/fork-windows.yml` runs on every push to
-`whitewh/main` and on manual dispatch. On a standard `windows-2025` runner it:
+`.github/workflows/fork-windows.yml` runs on pushes to `WhiteWh/zerus:whitewh/main`
+or `Phoenix-/zerus:Phoenix/main` and on manual dispatch from the matching branch.
+The Phoenix mirror is not a release branch. On a standard `windows-2025` runner it:
 
 1. runs the Rust tests and builds the release `hgs.exe`;
 2. builds the desktop app with the pinned Qt 6.10.3 and runs its offscreen Qt suites;
@@ -28,7 +51,8 @@ The workflow keeps one running build and one pending run (GitHub's default
 compatibility with the pinned actionlint version. New pushes replace the pending
 run without stopping the running build. The slot covers both building and
 publishing. After acquiring it, a Latest run checks out the current head of
-`whitewh/main`, including commits that arrived while it waited. That checked-out
+the repository's release branch (`whitewh/main` for WhiteWh, `Phoenix/main` for
+Phoenix), including commits that arrived while it waited. That checked-out
 SHA, not the triggering event's SHA, identifies the package, rolling tag and
 release notes. The run summary records both SHAs.
 
@@ -45,15 +69,16 @@ and feed used by existing WhiteWh installations. A numbered build keeps the exac
 commit selected at dispatch; it does not silently advance while waiting.
 
 Manual dispatch also offers `channel: latest` to refresh the rolling prerelease.
-Runs are accepted only from `whitewh/main` or an experimental tag. The internal
-build number remains available for diagnostics, even though the rolling release
+Runs are accepted only from the repository's release branch or an experimental
+tag. The internal build number remains available for diagnostics, even though the rolling release
 has no number. Only numbered WhiteWh builds embed `ZERUS_FORK_FEED_URL`; Latest
 and experimental builds embed no automatic update feed.
 
 ### Phoenix Latest builds
 
-The same workflow runs in `Phoenix-/zerus`: pushes refresh its own single `latest`
-prerelease, with the same queue, current-head checkout and package checks. Download
+The same workflow runs in `Phoenix-/zerus`: pushes to `Phoenix/main` refresh its
+own single `latest` prerelease, with the same queue, current-head checkout and
+package checks. Download
 `https://github.com/Phoenix-/zerus/releases/download/latest/zerus-windows-x86_64.zip`
 and install it manually. Only manual dispatch with `channel: numbered` creates a
 `phoenix-<run number>` release.

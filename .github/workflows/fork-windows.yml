@@ -9,7 +9,7 @@ name: Fork Windows build
 # feed, and no updater in its desktop app.
 on:
   push:
-    branches: [whitewh/main]
+    branches: [whitewh/main, Phoenix/main]
     tags: ['whitewh-exp-*']
   workflow_dispatch:
     inputs:
@@ -32,8 +32,10 @@ jobs:
   windows:
     name: Windows portable zip and release
     if: >-
-      (github.repository == 'WhiteWh/zerus' || github.repository == 'Phoenix-/zerus') &&
-      (github.ref == 'refs/heads/whitewh/main' || startsWith(github.ref, 'refs/tags/whitewh-exp-'))
+      (github.repository == 'WhiteWh/zerus' && github.ref == 'refs/heads/whitewh/main') ||
+      (github.repository == 'Phoenix-/zerus' && github.ref == 'refs/heads/Phoenix/main') ||
+      ((github.repository == 'WhiteWh/zerus' || github.repository == 'Phoenix-/zerus') &&
+       startsWith(github.ref, 'refs/tags/whitewh-exp-'))
     runs-on: windows-2025
     timeout-minutes: 150
     permissions:
@@ -48,7 +50,8 @@ jobs:
       CCACHE_DEPEND: 1
       CCACHE_MAXSIZE: 500M
       EXPERIMENTAL: ${{ startsWith(github.ref, 'refs/tags/whitewh-exp-') }}
-      LATEST_BUILD: ${{ github.ref == 'refs/heads/whitewh/main' && (github.event_name == 'push' || inputs.channel == 'latest') }}
+      LATEST_BUILD: ${{ (github.ref == 'refs/heads/whitewh/main' || github.ref == 'refs/heads/Phoenix/main') && (github.event_name == 'push' || inputs.channel == 'latest') }}
+      FORK_RELEASE_BRANCH: ${{ github.repository == 'Phoenix-/zerus' && 'Phoenix/main' || 'whitewh/main' }}
       FORK_RELEASE_PREFIX: ${{ github.repository == 'Phoenix-/zerus' && 'phoenix' || 'whitewh' }}
       # Embedded in hgs-tray: the build the updater compares and the feed it reads.
       # Empty for an experimental build, so it neither updates nor gets updated.
@@ -62,7 +65,7 @@ jobs:
         with:
           # Latest resolves the current branch only after getting its slot.
           # Manual numbered releases and experimental tags keep their event SHA.
-          ref: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && (github.event_name == 'push' || inputs.channel == 'latest') && 'refs/heads/whitewh/main' || github.sha }}
+          ref: ${{ !startsWith(github.ref, 'refs/tags/whitewh-exp-') && (github.event_name == 'push' || inputs.channel == 'latest') && (github.repository == 'Phoenix-/zerus' && 'refs/heads/Phoenix/main' || 'refs/heads/whitewh/main') || github.sha }}
           persist-credentials: false
       - name: Record the checked-out source
         id: source
@@ -207,7 +210,7 @@ jobs:
           COMMIT: ${{ steps.source.outputs.commit }}
         run: |
           assets=(artifacts/zerus-windows-x86_64.zip)
-          notes="Windows portable build $BUILD of whitewh/main at $COMMIT."
+          notes="Windows portable build $BUILD of $FORK_RELEASE_BRANCH at $COMMIT."
           if [ "$GITHUB_REPOSITORY" = 'WhiteWh/zerus' ]; then
             assets+=(artifacts/zerus-fork-feed.json)
             notes="$notes Installed automatically by fork builds of Zerus (docs/fork-updates.md)."

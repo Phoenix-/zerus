@@ -52,6 +52,12 @@ Repository documentation owns specifications; Beads owns tasks and blockers.
 
 ## Compatibility and operation
 
+In `Phoenix-/zerus`, `Phoenix/main` is the default integration and Windows release
+branch. Keep `whitewh/main` identical to `WhiteWh/zerus:whitewh/main`; merge that
+mirror into `Phoenix/main` with merge commits. Keep upstream proposals on separate
+topic branches and integrate them into `Phoenix/main` without changing their PR
+bases. See `docs/fork-updates.md` for the branch and publication workflow.
+
 Treat pasted `zerus://session?...` URIs as references to another Zerus conversation.
 Read them with `hgs inspect '<reference>'`; use
 `hgs @configured-alias inspect '<reference>'` when its local SSH alias differs.
