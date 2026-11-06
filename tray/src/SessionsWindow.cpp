@@ -1653,6 +1653,7 @@ SessionsWindow::SessionsWindow(const QString &hgsPath, QWidget *parent)
     auto *agentsLayout=m_inspector->body(InspectorCards::Tasks);
     agentsLayout->addWidget(m_children);
     m_ironRules=new IronRulesPanel;
+    m_ironRules->setBackend(m_client.rulesTransport());
     m_ironRules->changed=[this](int count){m_composer->setIronRulesCount(count);m_inspector->setValue(InspectorCards::IronRules,count>0?QString::number(count):QString());};
     // WhiteWh fork: lead and subordinate sessions of this project.
     m_leadPanel=new SessionLeadPanel;agentsLayout->addWidget(m_leadPanel);
@@ -1999,27 +2000,39 @@ SessionsWindow::SessionsWindow(const QString &hgsPath, QWidget *parent)
         if(folder.isEmpty())return;
         if(QMessageBox::question(this,tr("Fix folder rights"),
             tr("Give your Windows user full control of\n%1\n\nThe DeepSeek sandbox needs it to start a session there. Only your own access to this folder changes.").arg(folder))!=QMessageBox::Yes)return;
-        m_creationFixAccess->setEnabled(false);m_creationFixAccess->setText(tr("Fixing folder rights…"));
-        auto *process=new QProcess(this);
-        connect(process,&QProcess::finished,this,[this,process,id](int code,QProcess::ExitStatus status){
-            process->deleteLater();
-            const auto error=QString::fromUtf8(process->readAllStandardError()).trimmed();
-            if(status!=QProcess::NormalExit||code!=0){
-                m_creationFixAccess->setEnabled(true);m_creationFixAccess->setText(tr("Fix folder rights"));
-                showNotice(tr("The folder rights were not changed: %1").arg(error.isEmpty()?tr("unknown error"):error),true);return;
-            }
-            m_creationFixAccess->setText(tr("Folder rights fixed"));
-            showNotice(tr("Folder rights fixed; starting the session again."),false);
-            // The sandbox check refuses before hgs writes or starts anything
-            // (dsh.rs, ensure_sandbox_folder), so this "unknown" launch started
-            // nothing: it ends as refused and starts again, under a new launch id.
-            const auto op=m_creations->operation(id);
-            if(op["state"]=="unknown"&&op["failed_stage"]=="launching"&&!sandboxFolderOf(op["error"].toString()).isEmpty())
-                m_creations->ended(id,op["launch_id"].toString(),op["error"].toString());
-            if(SessionCreationController::canResume(m_creations->operation(id)))m_creations->resume(id);else m_creations->check(id);
-        });
-        ChildProcess::inheritStdioOnly(*process);
-        process->start(m_client.executable(),{QStringLiteral("sandbox-folder"),QStringLiteral("grant"),folder,QStringLiteral("--json")});
+        // T-o8dps1: a folder another account owns refuses the ordinary grant;
+        // the second try asks Windows for an administrator's approval.
+        const auto grant=[this,id,folder](const auto &self,bool elevated)->void{
+            m_creationFixAccess->setEnabled(false);m_creationFixAccess->setText(elevated?tr("Waiting for the administrator prompt…"):tr("Fixing folder rights…"));
+            auto *process=new QProcess(this);
+            connect(process,&QProcess::finished,this,[this,process,id,folder,elevated,self](int code,QProcess::ExitStatus status){
+                process->deleteLater();
+                const auto error=QString::fromUtf8(process->readAllStandardError()).trimmed();
+                if(status!=QProcess::NormalExit||code!=0){
+                    m_creationFixAccess->setEnabled(true);m_creationFixAccess->setText(tr("Fix folder rights"));
+                    const bool owned=error.contains(QStringLiteral("os error 5"))||error.contains(QStringLiteral("another account owns it"));
+                    if(!elevated&&owned&&QMessageBox::question(this,tr("Grant as administrator"),
+                        tr("Another account owns\n%1\nso your user cannot change its rights.\n\nWindows will ask an administrator to approve adding full control for your user to this folder. Nothing else changes and no ownership is taken.").arg(folder))==QMessageBox::Yes){
+                        self(self,true);return;
+                    }
+                    showNotice(tr("The folder rights were not changed: %1").arg(error.isEmpty()?tr("unknown error"):error),true);return;
+                }
+                m_creationFixAccess->setText(tr("Folder rights fixed"));
+                showNotice(tr("Folder rights fixed; starting the session again."),false);
+                // The sandbox check refuses before hgs writes or starts anything
+                // (dsh.rs, ensure_sandbox_folder), so this launch started
+                // nothing: it ends as refused and starts again, under a new launch id.
+                const auto op=m_creations->operation(id);
+                if(op["state"]=="unknown"&&op["failed_stage"]=="launching"&&!sandboxFolderOf(op["error"].toString()).isEmpty())
+                    m_creations->ended(id,op["launch_id"].toString(),op["error"].toString());
+                if(SessionCreationController::canResume(m_creations->operation(id)))m_creations->resume(id);else m_creations->check(id);
+            });
+            ChildProcess::inheritStdioOnly(*process);
+            QStringList args{QStringLiteral("sandbox-folder"),QStringLiteral("grant"),folder,QStringLiteral("--json")};
+            if(elevated)args.insert(3,QStringLiteral("--elevated"));
+            process->start(m_client.executable(),args);
+        };
+        grant(grant,false);
     });
     connect(m_creationCheck,&QPushButton::clicked,this,[this]{m_creations->check(m_selectedCreation);emit refreshRequested();});
     connect(m_creationStop,&QPushButton::clicked,this,[this]{m_creations->stop(m_selectedCreation);});
@@ -4251,7 +4264,14 @@ void SessionsWindow::inspect()
         if (streamed) streams->follow(entry->host, entry->session.name, entry->session.runId, entry->session.conversationId, m_cursor);
         else streams->unfollowAll();
     }
-    if (streamed) {
+    // Until a first read arrives, every refresh also reads the session directly,
+    // whatever the stream does: Activity and Send never depend on the stream
+    // alone (owner, 2026-11-05: after a restart and a tab switch Activity stayed
+    // empty and Send waited on "Checking the session…").
+    if (streamed && m_details.isEmpty()) {
+        m_inspectionAge.start();
+        m_client.requestInspection(entry->host, entry->session.name, m_cursor, entry->session.archiveId, false);
+    } else if (streamed) {
         m_inspectionAge.start();
         if (processes && m_client.requestInspection(entry->host, entry->session.name, m_cursor, entry->session.archiveId, true)) m_processPollAge.start();
     } else if(m_client.requestInspection(entry->host, entry->session.name, m_cursor, entry->session.archiveId,processes)) {
@@ -5370,7 +5390,7 @@ void SessionsWindow::sendReportToLead()
 // Prompt order.
 QString SessionsWindow::teamProjectRules() const
 {
-    const auto rules=IronRules::rules(projectOfKey(m_selectedKey));
+    const auto rules=m_ironRules ? m_ironRules->projectRules() : QStringList{};
     QStringList lines;for(int i=0;i<rules.size();++i)lines<<QStringLiteral("%1. %2").arg(i+1).arg(rules[i]);
     return lines.join(QLatin1Char('\n'));
 }
@@ -6224,7 +6244,7 @@ void SessionsWindow::deliverMessage(const QString &key, const QString &host, con
                 // draft, retries and the local copy keep the text alone.
                 // U35: an hgs that holds messages keeps this one until the agent takes the previous.
                 const bool hold = key == m_selectedKey && m_details.value("input_hold_supported").toBool();
-                const quint64 request = m_client.requestSendMessage(host, name, IronRules::wrap(IronRules::rules(projectOfKey(key)), text), attachments, runId, conversationId, {}, compactionId, hold);
+                const quint64 request = m_client.requestSendMessage(host, name, text, attachments, runId, conversationId, {}, compactionId, hold, projectOfKey(key).isNull() ? QStringLiteral("") : projectOfKey(key));
                 m_pendingMessages.insert(request, {key, runId, conversationId});
                 if (m_push && m_push->key == key && !m_push->request && m_push->text == text) {
                     m_push->request = request; m_push->run = runId; m_push->conversation = conversationId;
@@ -7521,6 +7541,7 @@ void SessionsWindow::updateWorktrees()
     if(m_ironRules){
         const auto project=entry?m_organization.groupFor(entry->identity):QString();
         const auto *group=m_organization.group(project);
+        m_ironRules->setContext(entry?entry->host:QString(), entry?entry->session.name:QString(), entry?entry->session.runId:QString(), entry?entry->session.conversationId:QString());
         m_ironRules->setProject(project,group?group->name:project);
         m_composer->setIronRulesCount(m_ironRules->rules().size());
     }
@@ -7657,7 +7678,9 @@ TeamNewDialog *SessionsWindow::teamNewForm(QWidget *parent)
     QString folder,project;
     if(entry){if(entry->host.isEmpty())folder=entry->session.cwd;project=m_organization.groupFor(entry->identity);
         if(const auto *group=m_organization.group(project))project=group->name;}
-    return new TeamNewDialog(m_teams,&m_client,computers,sessions,folder,project,parent);
+    auto *dialog = new TeamNewDialog(m_teams,&m_client,computers,sessions,folder,project,parent);
+    dialog->setProperty("ironRulesProjectId", entry ? m_organization.groupFor(entry->identity) : QString());
+    return dialog;
 }
 void SessionsWindow::ensureTeamNewForm()
 {
@@ -7686,6 +7709,7 @@ void SessionsWindow::ensureTeamNewForm()
     QString project=m_organization.groupFor(entry->identity);
     if(const auto *group=m_organization.group(project))project=group->name;
     m_teamNewForm=new TeamNewTab(m_teams,&m_client,computers,coordinator,project,m_teamNewTab);
+    m_teamNewForm->setProperty("ironRulesProjectId", m_organization.groupFor(entry->identity));
     m_teamNewForm->setDark(m_dark);
     m_teamNewForm->askDesigner=[this]{showTeamDesigner();};
     // A discarded draft leaves the session without a team: the tab starts over.

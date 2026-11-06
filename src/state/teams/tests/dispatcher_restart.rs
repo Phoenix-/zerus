@@ -45,7 +45,8 @@ fn a_crashed_member_is_restarted_only_when_the_team_allows_it() {
     let mut t = team();
     t.members.iter_mut().find(|member| member.id == "dev").unwrap().seen = Some(MemberSeen { at: 1.0, live: true });
     let crashed = stopped("codex/x/dev", "r1", "stopped");
-    // Default off: only the liveness record changes, as today.
+    // Off: only the liveness record changes.
+    t.settings.restart_crashed = false;
     let found = steps(&t, std::slice::from_ref(&crashed), 20.0);
     assert!(found.contains(&Step::Liveness { member: "dev".into(), live: false }), "{found:?}");
     assert!(!found.iter().any(|step| matches!(step, Step::Restart { .. } | Step::CrashStopped { .. })), "{found:?}");
@@ -63,6 +64,54 @@ fn a_crashed_member_is_restarted_only_when_the_team_allows_it() {
     // An hour later the old restarts no longer count.
     let found = steps(&t, std::slice::from_ref(&crashed), 4000.0);
     assert!(found.contains(&Step::Restart { member: "dev".into() }), "{found:?}");
+}
+
+/// The owner, 2026-11-05: three Kimi agents exited while their terminals
+/// stayed open, and the team treated them as live. An exited agent is a
+/// stopped session; with restart_crashed on it is restarted, the lead too.
+#[test]
+fn an_exited_agent_with_an_open_terminal_is_stopped_and_restarted_even_the_lead() {
+    let listing = json!([{"sessions":[{"name":"kimi/x/lead","state":"running","runtime_state":"live","process_state":"exited",
+        "activity":"idle","phase":"idle"}]}]);
+    let found = seen(&listing);
+    assert_eq!((found[0].live, found[0].free, found[0].state.as_str()), (false, false, "stopped"));
+    // A paused session stays paused.
+    let paused = seen(&json!([{"sessions":[{"name":"kimi/x/lead","state":"paused","process_state":"exited"}]}]));
+    assert_eq!(paused[0].state, "paused");
+    let mut t = team();
+    t.settings.restart_crashed = true;
+    t.members.iter_mut().find(|member| member.id == "lead").unwrap().seen = Some(MemberSeen { at: 1.0, live: true });
+    let found = steps(&t, &[stopped("claude/x/lead", "r0", "stopped")], 20.0);
+    assert!(found.contains(&Step::Restart { member: "lead".into() }), "{found:?}");
+}
+
+/// A Kimi request that waited for the Terminal and can be answered again goes
+/// back to the lead, and is never the lead's and the owner's at once.
+#[test]
+fn a_terminal_request_that_can_be_answered_again_goes_back_to_the_lead() {
+    use crate::state::teams::model::PendingQuestion;
+    let dir = tempfile::tempdir().unwrap();
+    crate::state::with_test_state_root(dir.path(), || {
+        let mut store = Store::open_at(&dir.path().join("teams/teams.sqlite3"), true).unwrap();
+        let mut t = team();
+        {
+            let dev = t.members.iter_mut().find(|member| member.id == "dev").unwrap();
+            dev.asked.push("k1:hk".into());
+            dev.terminal_question = Some(PendingQuestion { question_id: "k1".into(), question_hash: "hk".into(), approval: true, at: 1.0,
+                card: json!({"can_answer":false}) });
+        }
+        store.create("11111111-1111-4111-8111-111111111112", &json!({}), t.clone(), vec![]).unwrap();
+        let answerable = json!({"pending_questions":[{"question_id":"k1","question_hash":"hk","approval":true,"can_answer":true,
+            "questions":[{"id":"approval","header":"Bash","question":"Run this command?","options":[]}]}]}).to_string();
+        set_fake_hgs(Some(Box::new(move |_, _: &[&str], _: Option<&Value>| Ok(fake_output(0, &answerable, "")))));
+        sync_permission_forget(&t.id, "dev");
+        run_step(&mut store, &t, &Step::Permission { member: "dev".into() }, "").unwrap();
+        set_fake_hgs(None);
+        let after = store.load(&t.id).unwrap().unwrap();
+        let dev = after.members.iter().find(|member| member.id == "dev").unwrap();
+        assert_eq!(dev.pending.as_ref().map(|pending| pending.question_id.as_str()), Some("k1"));
+        assert!(dev.terminal_question.is_none(), "{:?}", dev.terminal_question);
+    });
 }
 
 #[test]

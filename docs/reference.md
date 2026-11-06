@@ -178,6 +178,17 @@ fresh session name; `--new -n review` uses your label and rejects an occupied na
 Arguments after `--` go to the agent or project wrapper. Arbitrary terminal commands
 can run through `hgs`; native lifecycle and Activity functions require an adapter.
 
+Inside a session's own terminal (tmux on Linux and macOS, the session host on
+Windows), `hgs` never attaches or switches that terminal, so an agent starts other
+sessions detached. `hgs claude /path/to/project --new -n review -d` starts the new
+session beside the current one and prints `hgs: started NAME`, as `fork -d` and
+`resume -d` do; `hgs guide launch` gives agents the full form with `--launch-id`.
+A launch without `-d` and `hgs a` are refused there with exit 2 (`already inside
+tmux session NAME; use --new -d or open a new tab`; Windows names no tmux). The new
+session gets its own session and run identity, never the caller's. Its account
+comes from the launch (`--account ID` or the computer's default for that agent);
+the account profile that the calling session runs under is not passed on.
+
 ### Session references
 
 **Copy session reference** in the desktop session context menu copies a
@@ -476,6 +487,91 @@ Repeat the same command without `--fresh`; the diagnostic attempt is preserved i
 paused: launch the intended conversation with its explicit native ID to bind it.
 
 ### Tracking and durable state
+
+`hgs session-action-status SESSION --json` reads one original lifecycle receipt.
+Supply the original `session-action` JSON unchanged, including its `request_id`,
+`action`, `expected_run_id`, `expected_conversation_id` and any original action
+arguments. The request is limited to 8 KiB; the existing private receipt is
+limited to 64 KiB. Its request digest, identities and result target must match.
+The reader opens no writer or lock, initializes no missing state, and leaves the
+receipt unchanged. It omits private native diagnostics.
+
+A stored `claimed` receipt is reported as `uncertain`; a later fresh read can
+observe the original writer's completed receipt. Missing evidence reports
+`unavailable`. Neither result proves that nothing ran or authorizes a retry.
+Malformed, unsupported or unsafe receipts are refused. This API covers only
+`session-action`, including Archive, Terminate and Forget; `clear-context` has
+separate receipts and is not accepted here.
+
+For a peer, use `hgs @example-peer --expect-machine MACHINE_UUID
+session-action-status SESSION --json`. The selected executable must advertise
+`lifecycle-receipt-status-v1` and the existing machine guard before JSON is
+forwarded. Its existing private Swarm catalog supplies the machine identity
+without initialization, locking or saving. An unguarded remote receipt read is
+refused. This reader is a recovery prerequisite; it does not enable durable
+delivery of pending Undo actions when Zerus quits. The independently reviewable
+[pure shared journal model](desktop-quit-journal.md) also leaves current Quit
+behavior unchanged; the actual store and detached delivery remain separately gated.
+
+The proposed [native quit-store design](desktop-quit-store-design.md) uses a
+persistent per-OS-user location derived from the effective UID's passwd home,
+never from `$HOME`: `<pw_dir>/.local/state/hgs/quit-v1/` on Linux and
+`<pw_dir>/Library/Application Support/hgs/quit-v1/` on macOS. Before any production
+anchor open, create or stat, an isolated launch must refuse durable delivery:
+HOME differs from that OS home, XDG state/data/config points away from its default,
+HGS_STATE_DIR or HGS_CONFIG_DIR was explicitly set, an install prefix is explicit,
+CLI selection (`ZERUS_CLIENT_HGS` or `--hgs`) or fleet routing (`HGS_SELF`,
+`HGS_PEERS`, `HGS_SSH`) is explicit, or a test/replay/headless marker is present.
+Empty, non-UTF8 and default-looking explicit selectors also refuse. Native origin
+evidence must precede Config::load's default HGS_STATE_DIR injection and the GUI's
+`--hgs` conversion; later mutations cannot erase an original override. Such
+launches keep drop-on-Quit. The proposed future caller uses a freshly selected,
+translated note in the group's existing Undo toast at registration; a refusal
+first discovered at Quit is diagnostic only, with closed codes and counts.
+The initial strict fence also excludes the maintained Mac LaunchAgent's `--hgs`
+launch and Linux launches passing it. Exact selected executable/configuration
+origin must be qualified on both maintained launch paths before delivery is
+enabled anywhere; this is tracked separately as `zerus-5wmh.66.2.34.3.5`.
+Tests use typed fixture scopes and decoy anchors; they never probe the owner's
+real anchor. Missing or tampered existing state requires explicit operator
+recovery, with unresolved charges retained. These are design requirements; the
+current runtime has no durable quit-store caller. Windows stays fenced.
+The proposed cleanup restriction also needs a native Git worktree lock before
+either version-2 ownership write: private legacy CLI controls showed that
+version-2 refusal alone does not fence fresh old manual removal. Worktrees retains
+the existing Blocked/locked reason. Exact new review/release semantics and the full
+legacy caller, partial-cut and crash/restart matrix remain separate gates; no
+runtime hold or unlock is implemented. Hold installation and delivery must not
+ship before the reviewed release surface is available in the same or an earlier
+build.
+
+A private actual V1-hgs/native-Git race also showed that Git 2.56 can remove a
+checkout, its V2 marker and a newly installed native lock after its already-issued
+remover passed the absent-lock check. A Git lock therefore supplies no drain
+proof. The proposed hold now requires verified native quiescence **and exclusion
+through publication before any hold write**, across old configurations and paused
+callers. Kernel birth/cwd/open-file evidence must be complete; hidden/unreadable
+or omitted observations are UNVERIFIED. Existing process helpers and repeated
+empty snapshots do not provide atomic exclusion, and no qualifying mechanism is
+available yet. If that proof cannot be established, publish no hold or durable
+delivery for the worktree and keep today's drop-on-Quit with the registration-time
+Undo note and Quit-time diagnostic boundary above. Today's Tauri client has no
+visible Quit notice; current toasts and the bounded local stderr drop line remain
+unchanged until the qualified caller lands. No new confirmation, exit delay or
+next-start notice is introduced for pre-hold refusal. After any partial hold,
+retain denial/manual recovery instead of
+rolling it back. No signals, restarts, process-name assumptions, old consent or
+unlock/downgrade repairs close the race. See the design's exact negative evidence
+and still-unprotectable legacy windows; R3, the full matrix and the shipped
+release-surface gate remain unchanged. This is documentation only.
+
+The proposed store and capture spool are excluded from all exports, diagnostics
+bundles and Private analytics aggregate export and are never uploaded. Logging
+and operator recovery output contain bounded counts, reason codes and digests,
+never stored session names, paths or targets. Installers and updater flows must
+preserve admitted helpers/children without signals or indefinite waits, and a
+replacement GUI must respect their still-charged global generation.
+
 
 `hgs hooks --account native-claude --json` inspects the account's hook
 registration without running the agent. Use another exact account ID for an
@@ -1051,16 +1147,37 @@ each other's entries); `qt-build` sets the launcher first in a build folder
 configured without it. A tool not found on `PATH` (or in cargo's bin folder)
 is named at the start of the run's output and the run builds without it.
 
+A build or test template (`cargo-build`, `cargo-test`, `cargo-clippy`,
+`qt-configure`, `qt-build`, `qt-test`) that fails with MSVC's C1083 "Cannot open
+compiler generated file ... Permission denied" or D8050 "failed to get command
+line into debug records" runs once more. These are the failures real-time
+scanning (Microsoft Defender) gives a compiler in a folder it scans. The run's
+output names the folder and asks for its build outputs (`.ci-build`, `target`)
+to be excluded from scanning. No other failure is retried, and a commit or
+merge never is.
+
 Start builds and long tests through Zerus so they show as work:
 `hgs team run` for a team member's templates (`hgs guide team-run`), and
 `hgs run --json [--wait]` with `{request_id, label, command, cwd?,
 timeout_minutes?}` for any session (`hgs guide run`). `hgs run` names the
-calling session by its process ancestry, runs the command in `sh -c` (`cmd /C`
-on Windows) in a detached runner with its whole process tree stopped after the
+calling session by its process ancestry, or a DeepSeek session by the
+conversation its harness exports as `DSH_SESSION_ID`, runs the command in
+`sh -c` (`cmd /C` on Windows) in a detached runner with its whole process tree stopped after the
 timeout (30 minutes by default, at most 240), keeps the last 4000 characters of
 output and records the run under the session; the same `request_id` never runs
 twice, and asking again reads its state. `hgs run --list --json` lists the
 session's newest runs.
+
+On Windows a Git Bash wrapper (`bash -c`, `env`, `nohup`, `timeout`, `xargs`,
+`sh -c`, `npx -c`) ends a Windows process between the session and hgs, so the
+process ancestry stops at a process that no longer exists. hgs then asks the
+session host which session's job holds it (`caller_session`): the host answers
+for the connection's own client, by the process ID the kernel gives it, and
+the session, pane and run marker must be exactly those of the record that
+`HGS_SESSION` and `HGS_RUN_ID` name. A leaked or stale session environment
+therefore never names the caller, and a process outside every session is still
+refused. A host from before this question answers `unsupported`, and the caller
+stays unproven as before.
 
 A job the session started otherwise makes it wait only while it waits for it. A
 long-lived process it does not wait for, such as a dev server, a watcher or a
@@ -1351,6 +1468,49 @@ Shift+PgUp/PgDn in Terminal, and Alt+↑/↓ in the Projects dialog's list.
 
 ## Agent teams
 
+### Team requests
+
+Every `hgs team OPERATION --json` reads one JSON object on stdin, or from a file
+with `--json-file PATH` (PowerShell has no `<<<`); a UTF-8 BOM is dropped. A
+command run from outside every agent session acts as the owner; `"by":"human"`
+is accepted and any other value refused. An agent session acts as itself.
+
+A member has one shape in `plan`, `add-member` and a draft:
+`{"id":"dev","role":"Backend","agent":"claude","account":"work","model":"opus","effort":"medium"}`
+(optionally `models`, `prompt`, `folder`, `computer`, `permissions`). Members,
+leads and tasks are parsed strictly: an unknown field is refused with its name,
+the accepted fields and an example, and a wrong type with serde's reason. A
+task's text is `description`. A member without `account` starts on its
+computer's default account for its agent, which the preflight names.
+`max_members` counts the members besides the lead; more members than that is a
+preflight error, so a plan, an approval and a draft's create are refused with it.
+
+`draft get` answers the draft's `fields` (name, goal, addendum, settings,
+members, tasks, phases and plan mode). A draft update sets only the fields it names;
+`members` is a list that replaces them all or an object of changes by member
+id, where null removes a member and a new id adds one. `plan_mode` is a draft
+field: the owner chooses it and the lead offers it with `plan_mode_reason`.
+A draft's tasks keep their `phase` and its `phases` list phases 2..N
+(`{"n":2,"title":"...","barrier":true}`), as a plan's do; a phase a task names
+but the list leaves out is kept untitled. Create keeps them all as Draft phases
+in order, which the owner approves one after another; a listed phase without
+tasks is refused.
+
+A swap card names, for each member, what changes (`agent`, `model`, `effort`,
+`account`, `prompt` or `session`), or `"fresh": true` for a new session with
+the same settings; an unknown field such as `with`, or a swap that changes
+nothing, is refused. One card swaps several members with
+`"members":[{"id":...},...]`. Before the new session starts, the session a swap
+replaced is paused when it can be (its conversation stays under Saved) and
+renamed to `<name>-replaced`, so the member's name is free even when the old
+session waits on a dialog. For a relaunch or a swap, the owner's word may name
+the members together ("перезапусти их", "relaunch them all"); it then pays for
+one change per member.
+
+The build broker is offered only for a shared folder that builds: a project
+build file at its root, an Unreal project or the project's `build_broker`
+table. A decided proposal reaches the lead's inbox message once.
+
 ### The Team designer's project and folder
 
 Team designer does not require an open session. Choose any project folder on
@@ -1379,9 +1539,12 @@ Claude's start-up trust stays manual for every other folder. No other agent
 ### The team roster on the owner's word
 
 The lead changes a team's roster only on the owner's explicit word: a sentence
-the owner typed in the lead's own session, at most 30 minutes old. For
-`add-member` the sentence must name what is added — the member's role or its
-agent/model, in English or Russian ("backend"/"бэкенд", "frontend"/"фронт",
+the owner typed in the lead's own session, at most 30 minutes old. Zerus reads
+that session's journal under its current and earlier names, so a session
+renamed after its journal began (its events stay under the name it had then)
+is still the lead's own. For `add-member` the sentence must name what is
+added — the member's role or its agent/model, in English or Russian
+("backend"/"бэкенд", "frontend"/"фронт",
 "qa", "reviewer"/"ревьюер", "expert"/"эксперт"; "DeepSeek"/"дипсик"/"dsh",
 "Claude"/"клод", "Opus"/"опус", "Codex"/"кодекс", "Kimi"/"кими") — not the
 generated id. The sentence says how many members it adds; one is the default.
@@ -1456,6 +1619,19 @@ Git checkout, otherwise the changed files its report names. A `hold` preset
 implementer's next task in that folder waits; a `checkout` preset tests a
 detached checkout of the attempt's commits instead and frees it.
 
+### Reports and interim reports
+
+A member reports with `hgs team report --json` (`task`, `attempt`, `text`): the
+attempt becomes reported and the task `submitted`, then its pipeline's first
+stage starts. `"interim":true` records progress on the same open attempt
+instead: the attempt stays open and the task stays `in_progress`, the member
+keeps its work, and no stage starts. The lead reads the interim text in its
+inbox and in the task's feed (`interim_report`); Waiting for you does not show
+it, so the owner sees it only in the feed. A newer interim report replaces the
+previous one on the attempt. A question is not a report: it goes through
+`hgs team ask` (the lead answers it with `hgs team reply`), never
+`hgs team report`.
+
 ### Free planning: the plan mode and the open phase
 
 A team plans in `standard` mode (the default) or `free` mode. `hgs team status`
@@ -1518,6 +1694,35 @@ option or the owner's own words; the proposal becomes `answered` with `answer`,
 and the lead's inbox carries it with the question. Waiting for you lists the
 question and answers it in place, as it does a lead's own open AskUserQuestion
 (`hgs team answer` with the question's id and hash).
+
+Every change the lead may make only with the owner's consent is a card the
+owner answers with Allow or Reject (task #21, owner 2026-11-05); no flow needs a
+typed sentence. Besides the kinds above, a proposal's kind may be one of the
+owner-gated operations `relaunch`, `scale`, `drain`, `approve`, `approve-phase`,
+`return-to-draft`, `edit-draft`, `move-phase`, `unpause-phase`,
+`phase-acceptance`, `accept-phase`, `extend`, `settings` and `full-tests`, with
+the operation's own fields beside `kind` and `reason` (or in `"input":{...}`):
+
+```sh
+{"request_id":"<uuid>","team":"<id>","kind":"relaunch","member":"hgs",
+ "reason":"its session failed to start"} | hgs team propose --json
+{"request_id":"<uuid>","team":"<id>","kind":"settings","settings":{"max_members":8},
+ "reason":"two more testers"} | hgs team propose --json
+```
+
+The proposal's `change` keeps `op`, the checked `input`, and the `summary` and
+`lines` the card shows. Allow runs that operation as the owner's own `hgs team
+<op>` (the same checks, adoption, budgets and side effects) under the
+proposal's stored request id, so a retried Allow answers its receipt and never
+applies the change twice; Reject changes nothing. `proposal_decided` names the
+`op`, the `summary` and the `request` it ran under, beside the operation's own
+events by You. A `switch-setting` card also sets `base_branch`, `full_tests` or
+`max_members` through the settings operation, and `iron-rules` (with `scope`
+project or session, its `project` or session `name`, run and conversation ids,
+`rules` and `expected_revision`) sets those rules as `hgs rules set` does. A
+typed owner word stays a fallback: its quote may be part of the owner's
+message, one message pays once for each member it names, and the check reads
+the lead session's main messages, not its last 200 events of any kind.
 
 Integration and a build are ordinary lead tasks, not a phase barrier. The owner
 or the lead adds the build for the open phase (`hgs team integrate-build`) and
@@ -1688,7 +1893,13 @@ returns "timed out after N min". The plan chooses a preset, never a command:
 only the owner's catalog writes it.
 
 A stage member that ends its turn without a verdict, with no stage question
-open, gives the lead one stalled item while the stage stays its own. An
+open, gives the lead one stalled item while the stage stays its own. A turn
+that waits for the lead's answer or for Background work (or for a Zerus build,
+such as the tests the reviewer runs) is not stalled: no silent item appears
+while that work runs, and the member may still report its verdict. The budget
+the member declared (`hgs team expect`) or the block timeout's "waiting N min"
+message tells the lead when the wait is too long; it is never reported as a
+missing report. An
 unconfirmed hand-off is not retried on a timer: the lead hears it stalled only
 with evidence that it did not arrive (the member stayed idle and free since
 delivery, with no question and no run claim under the stage's id), and the
@@ -1710,6 +1921,48 @@ the next hand-out names the stage's findings (or the send-back's reason), and
 that attempt is not counted as a failed member. Once the preset's rounds run
 out, the lead's decision is the last word: a rejection reaches the next
 hand-out with its reason, not the returned stage it followed.
+
+A non-final `hgs team reject` defaults to rework: the task keeps its assignee
+and the next attempt goes to that member as soon as it can take it. The member
+is reserved while the returned task is open, including a hold or an undecided
+report; no other task or stage is handed or rebalanced to it. A member with an
+open approval, a usage limit or a stopped session keeps the rework without a
+time limit. The lead's inbox shows `#N waits for its member, N min`; an explicit
+`hgs team reassign` moves it. With `"fresh":true`, reject uses the previous
+retry policy, preferring a free member of the same role that did not fail the
+task, subject to existing assignee pins. `"hold":true` still holds a returned
+task until release, and `"final":true` ends it.
+Only an explicit fresh rejection may bypass Output protection while the failed
+member has other work. Automatic refusals preserve shared/missing Output
+protection; a fresh rejection's exception ends when its next attempt is recorded.
+A draining member may finish its own reserved rework before leaving. Explicit
+reassignment clears the rework reservation and its wait age. Returning an
+unstarted phase to a draft also clears rework reservations. Member-wait inbox
+items exclude held rework and members available to take it.
+
+A reassign, a take-over or a cancel of a task whose attempt its member is still
+working on (sent or delivered, not reported) tells that member at once: one
+`[Zerus team · from: Zerus · task: #N · stop]` message names the task and why it
+left, asks it to stop the builds, tests and commands it started for it, not to
+report it and to commit nothing more for it (`stop_told`). It is sent as soon as the
+session runs, also while it is busy: an agent that reads messages mid-turn stops
+at once, others when the turn ends, and the member's next task then goes out
+without a message from the lead. With the owner's team setting
+`interrupt_revoked` (off by default; the lead cannot change it) a busy turn is
+interrupted once before the message (`revoked_interrupted`). A reported
+attempt, or a reassign to the same member, sends nothing.
+
+Tasks may declare `"output":["src/api.rs","src/protocol/"]`: repository-relative
+files or directories, with a directory covering all paths beneath it. Plan,
+extend, add-to-phase and edit-draft `tasks_update` normalize separators, remove
+redundant `.` components and duplicate paths, and retain this field in task
+status. A task has at most 128 paths, each at most 1024 characters and together
+at most 32 KiB. Absolute paths, parent (`..`) components, colons and control
+characters are refused; `.` covers the repository. Existing tasks without
+output remain valid. Rebalance keeps a queued task with its original member
+when its output overlaps that member's task in progress (equal paths or
+containment by path components). It also keeps a task without output whenever
+that member has work in progress. `src/api` does not overlap `src/apis`.
 
 A stage member may ask the lead with `hgs team ask` (its question belongs to the
 stage run and the lead answers it with `hgs team reply`), and the stage hand-off
@@ -1766,7 +2019,7 @@ owner and the lead change a plan, as before.
 
 ### Restarting a crashed member
 
-`Settings.restart_crashed` (off by default, only the owner sets it) launches a
+`Settings.restart_crashed` (on by default, only the owner changes it) launches a
 member's session again into the same folder and conversation when its process
 exits on its own: not a pause, an archive, a usage limit, a swap, or a session
 Zerus has not seen running since its last restart. An exit you type yourself in
@@ -2128,6 +2381,13 @@ tool permissions qualify. Ordinary questions, startup trust, incomplete panels a
 persistent permission changes remain manual. Existing native identity and
 delivery guards still apply.
 
+Zerus Next uses its live event-stream catalog for the same bounded discovery;
+it does not add a peer poller. Its opt-in is device-local and is never seeded
+from Qt or imported by migration. Confirm it separately in Next. Cached,
+offline or unidentified computers cannot admit an approval; each candidate is
+freshly inspected, and its exact identities are checked again before the
+existing native Answer lane runs under the journal's original request UUID.
+
 The same Settings page contains this computer's private approval journal, naming
 the computer, session, time, question, selected answer and confirmed outcome.
 Each attempt is durably reserved before native input. Failed, cancelled and
@@ -2181,6 +2441,14 @@ send. Saving failures are shown in the editor and retried locally; sending start
 only after its recovery snapshot has been saved.
 
 Delivery verifies the exact run, process, conversation and native input state.
+A busy Claude or Codex session can accept a message through its native queue
+when its empty composer is recognized. An unknown busy layout or a draft refuses
+with `agent busy` before submission; wait or inspect Terminal rather than typing
+through that refusal. Deliberate send refusals keep only the latest private
+`input_diagnostics/codex.json` or `claude.json` under the session state directory.
+Each sample is at most 16 KiB: cursor coordinates, bounded cursor-row text and
+structural metadata for at most eight nearby rows. Text from other rows and the
+attempted message is omitted. Listing sessions does not create samples.
 For Claude and Kimi messages ending in a literal backslash, the paste includes a
 final newline so the single Enter submits the unchanged message instead of
 activating the agent's backslash-Enter line continuation. This is verified
@@ -2522,7 +2790,15 @@ longer shows one. A history longer than 8 MiB (4 MiB for another agent), a
 record Kimi is still writing, a line that is not a JSON object with one string
 type, an interaction record without its ID or of a kind Kimi does not write,
 or a repeated request ID keeps the approval read-only. Types and IDs are
-compared as decoded JSON. Every key and pasted feedback line first finds the same
+compared as decoded JSON.
+Experimental and off by default: an empty file
+`~/.config/hgs/kimi-unverified-edit-approvals` (in `HGS_CONFIG_DIR` when set)
+also lets Zerus answer Kimi's **Edit** and **Write** approvals, from Activity
+or by a team lead. Zerus cannot redraw Kimi's diff, so it checks less than for
+Bash: the same sole unresolved request of every agent, its hash and active
+tool, and exactly one complete panel on screen titled for that tool with the
+default choices; the card says so above the request. Delete the file to turn
+it off. Every key and pasted feedback line first finds the same
 unresolved request, with its active tool call, in the same run, process and
 pane. The
 choices are Kimi's: **Approve once**, **Approve for this session**, **Reject** and
@@ -2597,6 +2873,15 @@ After **Update now**, the desktop shows a notice for that state: Codex is still
 installing its update, or it has exited and the session needs a resume. An
 older host's receipt has no `codex_update`; the desktop then only switches to
 Terminal.
+
+Codex's **Approaching rate limits** chooser also appears in Activity and on the
+phone after a turn. Its reviewed **Switch to gpt-6-luna**, **Keep current model**
+and **Keep current model (never show again)** choices use the exact guarded native
+answer path. Zerus never selects one automatically. A changed or incomplete
+chooser stays **Needs input** with an **Open Terminal** hint; it never authorizes
+a model change or an ordinary message. Each answer pins the process, run,
+conversation and complete panel before every key, and uncertain delivery is never
+replayed.
 
 After a resume, Codex asks **Resume paused goal?** when the conversation's goal
 is paused, stalled or limited by usage. Activity shows the goal from Codex's goal
@@ -2730,7 +3015,10 @@ native usage. The saved native identity changes only on the real hook, and an
 unconfirmed command does not reset counters.
 A stopped session offers **Start fresh…** instead, with the same confirmation, and
 keeps **Send** available: it offers **Resume and send** with the full saved context,
-**Resume, compact and send**, or **Start fresh and send**. The compact option waits
+**Resume, compact and send**, or **Start fresh and send**. Zerus Next names the
+same choices **Resume**, **Compact and resume** and **Start fresh** under its
+"Start the session to send?" title, with **Cancel** last as the default; its
+dialog actions wrap onto further rows rather than leaving a narrow dialog. The compact option waits
 for the restored conversation to accept input, then runs native compaction and
 delivers the unchanged message only after confirmed success. A failed start, an
 unexpected conversation or three minutes without readiness cancel that send and
@@ -3492,6 +3780,13 @@ archive-triggered deletion. External or old worktrees without matching ownership
 receipts require explicit review in Projects. Recent activity or a folder/branch
 name alone never establishes that a worktree is disposable.
 
+Archive cleanup reports also carry a versioned exact archive identity and the
+launch-ownership verdict. When it fits the bounded report, `review` retains the
+structured row from the original removal check, including the total process
+count before sample limits. Missing rows stay missing. This evidence supports
+counts-only notices and retained review; displaying it never starts another
+check or removal. Restore still requires the existing fresh exact-archive guards.
+
 Read the host policy with `hgs [@host] worktrees policy get --json`; save the full
 reviewed policy from JSON stdin with `worktrees policy set --json`. The revision
 must still match. Existing policy files and writes require every versioned field;
@@ -3929,6 +4224,15 @@ to save a choice. Omit effort to inherit the selected model's provider default;
 pass `--model ''` to return to provider settings. Revisions prevent overwriting
 another account edit made while the dialog was open.
 
+A DeepSeek account's catalog comes from its running host. Without one, it is
+what the composed profile configures (`dsh --profile hgs --dump-config`, which
+starts no host): the `models` of the `llm-deepseek` entry, or else the installed
+transport's bundled models, each named as dsh names it (for example
+`deepseek-official/deepseek-flash`, DeepSeek-V4.1-Flash). The answer then
+carries `"source":"dsh-profile"`. New team's member rows offer these models, and
+a DeepSeek member's model is applied after its session starts, as
+`provider/model` or as a bare id (`deepseek-flash`) that one provider offers.
+
 Accounts collects provider profiles from connected machines. Verified provider
 account ID, or email with organization, groups the same account across hosts;
 matching display names alone do not. Providers, organizations and conflicting
@@ -3992,6 +4296,13 @@ hgs @mac account login work
 hgs @mac codex /path/to/project --new --account work
 hgs account copy native-codex --from @local --to mac --as codex-work --label Work
 ```
+
+`account ls` advertises `setup_revision: true` when terminal setup accepts an
+optional `--revision REV` on `account login`, `account install` and `account start`.
+That check runs when the terminal command executes, before provider work. Calls
+without the option retain their existing behavior. Next uses the capability,
+exact computer identity and fresh catalog snapshot; unsupported or uncertain
+setup is never replayed.
 
 `accounts.json` stores metadata and selected permission modes; authorization stays
 in the profile's own directory. Managed profiles clear inherited API tokens;
@@ -4283,8 +4594,11 @@ with a message naming it instead of falling back to the cloud account.
 
 ## Official DeepSeek Harness
 
-The native adapter accepts exactly the reviewed `@deepseek-ai/dsh` releases
-`0.2.1-rc.2` and `0.2.1-rc.5`. Install a reviewed release on the agent host,
+The native adapter starts every `@deepseek-ai/dsh` release (owner, 2026-11-04).
+Zerus reviewed `0.2.1-rc.2` and `0.2.1-rc.5`; any other release starts with a
+note naming them and `harness-unreviewed` in the host's folder, since the bridge
+uses harness internals and a feature may fail there. Only a harness that reports
+no version is refused, before any session exists. Install a reviewed release on the agent host,
 sign in and choose **DeepSeek Harness** in New session:
 
 ```sh
@@ -4621,6 +4935,17 @@ the live session's creation time and refused when a tracked run owns the session
 Changing tab, session or connection during transfer cancels insertion.
 **Open externally** and **Copy connect command** retain access from other clients.
 
+On Unix, **Terminate** can close an untracked Shell row after confirmation. The
+confirmation captures the tmux socket and server, session ID and creation time,
+and the sole pane's ID, PID and process birth identity. The owning CLI rechecks
+those facts under its state lock and closes only that terminal, then verifies the
+original shell process exited. Tracked agent rows keep their separate verified
+termination path. An untracked shell creates no archive and never offers worktree
+or cache removal; its working folder stays, and detached jobs may continue. If
+the terminal changed or cannot be verified (including multiple panes, grouped
+sessions or linked windows), refresh the row or open its terminal and use `exit`
+after its jobs finish.
+
 If SSH drops, tmux on the remote host continues running. Reattach normally. If the
 local tmux server dies, its sessions are gone; `hgs` restores the terminal mode and
 reports this instead of leaving the alternate screen active:
@@ -4798,15 +5123,27 @@ never `HGS_TRAY_RESTART=0`.
 
 Linux installs the binary under `~/.local/bin`, a systemd user service under
 `~/.config/systemd/user` and a launcher under `~/.local/share/applications`.
-The launcher is not a second autostart entry. `HGS_LINUX_GUI=client` selects the
-Tauri client, later installs retain the selected GUI, and a fresh installation
-defaults to Qt. `HGS_INSTALL_PREFIX` redirects the binary, launch files and
+The launcher is not a second autostart entry. Fresh installs and upgrades default
+to Zerus Next; `HGS_LINUX_GUI=client` selects it explicitly.
+`HGS_LINUX_GUI=qt` keeps the Qt source-build fallback until Linux acceptance. `HGS_INSTALL_PREFIX` redirects the binary, launch files and
 updater state into a scratch prefix and performs no service-manager action; see
-[Linux source installation and the Tauri client switch](linux-distribution.md).
+[Linux packages and source installation](linux-distribution.md).
 The service belongs to `graphical-session.target`, restarts after crashes and
 does not loop on exit code 4 (system tray unavailable). Compare
 `systemctl --user status hgs-tray.service` and `journalctl --user -u
 hgs-tray.service` when startup fails.
+
+The separate `hgs-desktop.service` uses the selected CLI's rendered registration
+and readiness contract. `zerus-setup --desktop-service` registers it for an AUR
+installation; the Next source installer registers it directly. Current-login
+graphical variables are imported before the service starts. A session refresh
+restarts only this backend when needed, and UI-only upgrades preserve an
+unchanged backend. CLI source upgrades refresh an existing owned registration
+without creating a service for a headless CLI-only installation. Package
+upgrades perform no user-service actions. Readiness means the matching IPC
+endpoint is ready, not that background workers have started. See
+[Linux desktop background service](linux-distribution.md#desktop-background-service)
+for custom configurations, bare window managers and startup diagnostics.
 
 On macOS the installer uses Qt/Homebrew, builds and ad-hoc-signs an app bundle,
 and installs it under `~/Applications/hgs-tray.app` with
@@ -4853,10 +5190,20 @@ No reverse connection is created by default. Explicit peer setup uses
 | `--open-mode MODE` | Linux auto/tab/window/clipboard; macOS terminal/clipboard; Windows auto/tab/window/console/clipboard |
 | `--selftest` | Headless hgs connectivity check |
 | `--sessions` | Open the workspace; on Windows also the default |
+| `--desktop-target JSON` | Zerus Next on Linux: open the exact `computer`, `run` and `conversation`; implies `--sessions`. Navigation data only, with no notification or writer authority |
 | `--background` | Start in the tray only; the default on Linux and macOS. Not together with `--sessions` |
 
 A single-instance socket forwards repeated launches to the running GUI: one that
 would open the workspace opens it there.
+The Linux target value is bounded to 8192 bytes and accepts only those three
+fields. It follows the exact run and conversation through a session rename and
+refuses an archived or replaced session. The service's selected-child launcher
+requires the separate environment-input capability and passes the same target
+as `ZERUS_CLIENT_DESKTOP_TARGET` in that child only, keeping the identifiers out
+of its command line. An ephemeral Wayland activation token also travels only in
+that child's environment. The new GUI consumes both values before starting its
+workers; forwarding navigation to an already running GUI carries no token.
+Conflicting argument/environment targets and target/background starts refuse.
 On Linux and macOS, concurrent launches take turns on it, and a launch such as
 `hgs-tray --sessions` leaves it to the `hgs-tray` systemd or launchd service
 while that service runs or restarts: it waits up to 30 seconds for the
@@ -4965,6 +5312,27 @@ whose `install.sh` or `hgs_state.py` has CRLF line endings; `.gitattributes` kee
 `*.sh` and `*.py` in LF. Identity files in `machines.local.json` may be Windows
 paths or `~\…`.
 
+On every platform, setup snapshots the CLI sources and the transitive local Cargo
+path dependencies, including the root crates and `client/core`, before SSH starts.
+The private snapshot includes package manifests, `src`, declared build/library/bin
+inputs, the root lockfile, CLI installer/helper and installer scripts. The two
+shared `voice_video.rs` and `voice_rejection.rs` validators under the relay source
+are included when present; no relay or connector package is bundled. It excludes
+build outputs, VCS directories, hidden entries, Node modules and Python caches.
+It refuses symbolic or nonregular source entries, external path dependencies and
+workspace inheritance or patch/replace overrides. The bounds are 32 packages,
+20,000 visited/copied entries, 64 MiB total, 8 MiB per file (1 MiB per manifest),
+32 directory levels and a five-second scan budget. A refusal makes no SSH call.
+The remote CLI-only install preserves configuration and existing checkouts, skips
+the mobile connector and does not install or restart services or agent processes.
+The optional `--revision` binds setup to the saved profile snapshot, checked both
+before source preparation and before SSH. Existing setup argv remains supported.
+Next confirms the selected machine and source folder, keeps the page busy and
+shows bounded setup output when the command ends. Keep Zerus running until it
+finishes. A timeout or uncertain result is shown for review and never retried
+automatically. Enabling local Windows sessions has its own confirmation and
+rechecks the original local machine identity and current host status.
+
 **Swarm worker.** Windows has no user service manager. The desktop app runs one
 hidden `hgs.exe swarm worker` and restarts it after an exit. The delay doubles
 from one second up to five minutes and resets after a run of a minute or more. A
@@ -5032,6 +5400,75 @@ missing the session does not start, and the member's error — shown in the Lead
 inbox — says `the DeepSeek sandbox needs full control of <folder>` with the
 one-line fix `icacls "<folder>" /grant *<SID>:(OI)(CI)F`. A member never repairs
 ACLs itself: it reports the exact error to the Lead.
+
+**DeepSeek members whose host is starting.** One DeepSeek host serves every
+DeepSeek session of a user on a computer. A start launches it when none runs
+and waits 35 s for it to answer; a later start that finds a host launched
+recently and still running waits for that one instead of launching a second.
+When a member's start fails only with `DeepSeek host is still starting`, the
+dispatcher starts the member again by itself (a `launch_waiting` event, no
+error, no inbox item), up to three times. If the host still does not answer,
+the member fails once with that reason and the number of starts, and the
+Lead's inbox shows it; any other start failure is reported at once. A relaunch
+starts the count again.
+
+**Members' clones.** A clone member's folder is made by `hgs worktrees create
+--clone`: a full `git clone --local --no-hardlinks` of the team's repository (no
+hard links, because the folder's ACL grant would reach the source's files), then
+the member's branch, started from the team's base branch when one is set, else
+from the HEAD of the team's folder. The clone has its own 25-minute deadline and
+the checkout of the branch its own 10 minutes, so a large repository on Windows
+no longer fails with `Git operation cancelled or timed out`. When the clone
+finished but the branch was not made, the clone is kept: starting the member
+again finishes it (fetching the base when it moved on), provided the folder is a
+clone of this repository with no changes and without that branch. Any other
+folder there is refused, never changed.
+
+**DeepSeek members in their sandbox.** On Windows a DeepSeek member's shell runs
+in DeepSeek's sandbox at Low integrity. It reads Zerus state but may not write
+it, and the session host keeps it out (a sandboxed caller hears
+`this process runs in a sandbox below the session host's integrity level`).
+Such a member still does its work through its own folder, where its sandbox
+writes, and the team worker applies what it leaves there on its next tick
+(about three seconds):
+
+- `hgs team report`, `ask`, `commit` and `hgs team run` wait there as before.
+- `hgs run` waits there too. The worker records the run as the member
+  session's work, so the session is Building, and starts it at Low integrity
+  with its temporary files in `<folder>/.zerus-team/tmp`: a member's run never
+  runs above its sandbox. `--wait` and `--list` read the run's record as for
+  any session.
+- `hgs ls`, `hgs inspect <session>` (with `--skip-processes` or
+  `--after N`), and `hgs task list` or `hgs task get` of a named project
+  (`--project P` or `PROJECT/T-xxxxxx`) are answered by the worker, which runs
+  the read outside the sandbox and leaves the output in the folder. These reads write, send, start
+  and attach nothing, and the sandbox already reads every file they read.
+  Every other command, such as `send`, `launch` or `attach`, stays closed to a
+  sandbox.
+
+**Codex members on Windows.** Codex's Windows sandbox runs a member's commands
+as its own local user (`CodexSandboxOffline`). That user reads the hgs state but
+may write none of it, and may not read the owner's configuration
+(`~/.config/hgs`), which stays the owner's only. hgs recognizes such a process
+because the state belongs to another user and the configuration is unreadable.
+It then loads no configuration (no peers) and takes the same ways as a DeepSeek
+sandbox: team calls, `hgs run` and the reads above wait in the member's folder
+for the team worker. The member is the session its inherited `HGS_SESSION` and
+`HGS_RUN_ID` name; only the folder the request is written to proves it. A Codex
+member's `hgs run` runs in `codex sandbox` on its own folder, never above it:
+the command must start in that folder. Codex keeps `.git` read-only, so its
+commits go through the `git-commit` template.
+
+This needs a running team: a sandboxed DeepSeek session outside a team is told
+so. `hgs self` answers a DeepSeek tool command from the binding of its
+`DSH_SESSION_ID`, in or outside a sandbox. The worker runs a member's `hgs run` at Low integrity but outside
+DeepSeek's own confinement, so the run, like any Low process, may use the
+network and named pipes of Low processes.
+
+A DeepSeek member's own folder is a clone: a worktree's git metadata lives in
+the main checkout's `.git`, which its sandbox may not write. A worktree asked
+for it (by a role, a template, the New team form or the worktree policy, which
+a clone also meets) becomes a clone; an adopted session keeps its folder.
 
 **DeepSeek session-log upload.** Zerus starts and resumes DeepSeek sessions with
 the official session-log upload off, unless the owner turns the block off in
@@ -5358,6 +5795,35 @@ change is followed by a local persistence failure, the scoped action remains
 uncertain; inspect the retained bindings before choosing another action. An
 uncertain receipt never authorizes another native rename automatically.
 
+For a current journal-backed main session, `hgs inspect NAME --read-observation` or
+`hgs [@configured-alias] inspect '<reference>'` also returns the host's **raw**
+`read` object (or `null`) and `read_observation`. Direct-name inspection without
+`--read-observation`, including Activity/Processes polling with `--after` or
+`--skip-processes`, does not invoke this reader or add either field. The
+reference route opts in automatically. This does not enrich the mark
+with the current reply or acknowledge anything. Check `read_observation.complete`
+and `freshness: "observed"`, then match both its `target` and the inspection's
+current name/run/conversation to the intended target. A portable reference may
+resolve a resumed conversation with a different run; that is not acknowledgement
+of the original run.
+
+The observation records `observed_at` (host Unix seconds), `source_state` and a
+`sha256:` content `generation` of the observed `read-marks.json`; a missing file
+has `source_state: "absent"`, null generation and null read. Marks are stored by
+stable journal owner and conversation, not by run, so the target's current run
+binding is reported separately rather than invented in the stored mark. Each
+private regular file read is capped at 16 MiB, with a one-second cooperative
+budget shared by the observation and exact selected binding checks. Only the
+selected owner/conversation is materialized; unrelated marks are skipped during
+parsing. The original file and its path are checked for replacement/change.
+A busy, malformed, oversized, leaf-linked, nonprivate, changed or mismatched source
+returns `complete: false`, `freshness: "unknown"`, a short `code` and null read;
+this is not evidence of an unread or acknowledged part. An observation is a
+point-in-time read, not a promise that the source stays unchanged afterward.
+These fields are not supplied for archives, subagents or other provider-specific
+inspection paths. No shared-read file, lock, delivery or background worker is
+created or changed by this observer.
+
 `inspect` includes conversation, phase/activity, prompt/last message, tools,
 subagents, events and cursor. Initial reads return recent events; `--after` advances
 the cursor. Reset it when conversation ID changes. `history_truncated` discloses
@@ -5422,6 +5888,11 @@ automatically, and a held message is never replayed. Dialogs, drafts and unknown
 prompts still refuse a direct send; open the terminal there. Questions carry request identity/hash
 through `pending_questions`; answers use the exact unchanged request.
 
+Messages may begin with an absolute file path, including a directory named like
+a command (`/help/capture.png`). A first token of `/name` without another slash,
+or leading `!` shell mode, still requires Terminal. An argument containing a path
+does not turn `/command` into an ordinary message.
+
 ### Desktop background service
 
 ```sh
@@ -5429,6 +5900,42 @@ hgs desktop serve
 hgs desktop status --json
 hgs desktop watch --json
 ```
+
+`hgs desktop serve --background` explicitly starts the service-owned bounded
+fleet runtime. The actor applies its watch packets and publishes catalog/count
+updates through the same endpoint. It keeps each original event's ingress permit
+through the database transaction; UI-supplied feed packets cannot enter the owned
+observation path. Failed frames invalidate their exact source until resnapshot.
+Plain `serve` and fresh registrations stay passive. On Linux and macOS, the maintained
+installer supports explicit `--mode background|passive` after the authenticated
+frontend handoff; see [Linux mode selection](linux-distribution.md#select-the-desktop-service-mode)
+and [Mac mode selection](macos-distribution.md#explicit-desktop-service-mode).
+Ordinary refreshes preserve the selected mode. Generic approval policy requests
+remain refused; ownership and each effect require their own authenticated grants.
+
+Background mode also owns one presence sampler/writer outside the actor. It
+samples every two seconds and uses the existing `desktop-presence.json` format.
+It writes on a 30-second heartbeat, a lock change or a return from at least
+120 seconds idle to active; steady samples do not each sync a file. Readers
+already age the recorded idle value between writes.
+The worker retains the same scoped lock used by `hgs presence set` until its
+last sample/write has returned and it has joined. A concurrent legacy writer is
+refused. Unknown idle or lock input never defaults to zero/unlocked or refreshes
+the previous record. Wayland durations measured only since observation began
+are also withheld until actual resumed input is observed. Thus a service restart
+does not turn an hour-away owner into a recently active owner. Existing records
+expire normally after 120 seconds without valid samples. Status distinguishes
+published, unknown-input, write-error and incomplete-shutdown states.
+
+Revoking background mode stops and drains its own streams before returning a
+checkpointed receipt. These receipts bind the service incarnation; an old revoke
+cannot stop a replacement instance. Any retained revoke (even interrupted) or
+historical handoff state also prevents background startup after login/restart:
+the endpoint stays passive with `background_start.code=explicit_handoff_required`.
+Passing `--background` again never clears that block. A new explicit handoff is
+part of the coordinated UI cutover, not an automatic service restart.
+Incomplete shutdown is reported as an error,
+never as drained. Native agents, tmux and unrelated services are not stopped.
 
 The existing `hgs presence set --json` payload and success output remain
 compatible. Its writes now hold a scoped `desktop-presence.lock`. Before any
@@ -5442,11 +5949,11 @@ listings read at most 4 KiB of a private regular leaf; malformed, oversized or
 special files provide no presence evidence.
 
 The private `desktop-v1` service kernel is local to one user and canonical
-configuration/state identity. It is **passive until the writer handoff is
-implemented**: it starts no fleet readers, presence/read workers, notifications
-or automatic approvals. It does not register itself with an OS service manager.
-Existing desktop clients retain their current owners. This kernel alone does
-not establish Qt retirement or native platform acceptance.
+configuration/state identity. Plain `serve` is passive; explicit background mode
+owns the fleet readers and presence writer described above. Read workers,
+notifications and automatic approvals remain inactive pending their integration.
+Maintained installers register the service with the OS manager. Desktop client
+cutover and native posting are separate changes.
 
 `status` is read-only and never starts a service or creates state. Its JSON
 reports `running`, `ownership`, `configuration`, executable `version`, schema,
@@ -5532,6 +6039,26 @@ Unary answers do not advance the broadcast watermark. A new epoch invalidates
 subscriptions; it never authorizes replay. EOF on a watch's stdin detaches that
 client. Control requests use a separate connection, not the display stream.
 
+Status, watch hello/heartbeat and `catalog_changed` include `attention_counts`.
+Its `shared_host_state` scope uses the existing session projection, shared read
+marks and shared mute settings; `local_marks_included:false` means device-local
+Review later and acknowledgement overlays are still separate. These presentation
+counts confer no posting, read or approval authority. Per-computer entries carry
+source incarnation/generation, online and complete flags. The aggregate reports
+unknown attention as null while any expected computer is incomplete or offline;
+`known_attention` is explicitly partial. The service epoch, projection generation
+and revision bind counts to the same subscriber stream. A restart invalidates
+coverage and catalog cursors, preserving only last-known display rows.
+
+The fleet runtime seam reuses the existing watch-v1 source supervisors: at most
+64 computer workers, four concurrent connection attempts and 16 MiB/1,024 ingress
+items, with permits retained through actor application. There are no per-session
+workers. Reconnect uses the existing 5/15/60/300-second backoff and resets source
+generation; gaps trigger a complete resnapshot. Removed aliases retire their
+exact projection and use the normal bounded collector. Slow UI subscribers never
+hold source ingress. The active service lifecycle starts and drains this runtime;
+the passive kernel and UI feed cannot activate it.
+
 `hgs desktop request --json` reads a JSON object from stdin with `op` and a
 canonical UUID `request_id`. `ping` returns an exact-ID, read-only `pong` with
 `durable:false`.
@@ -5562,11 +6089,80 @@ cannot enable writers or approvals without the later live delegation, effect
 guards and revocation protocol. The kernel writes no takeover marker. See the
 exact [migration contract](desktop-migration.md).
 
+In service mode, Settings > Files > Apply saves the selected folder's cache
+limit in the service. Imported UI preferences remain display data until that
+explicit action. Refresh and download completion use the saved service policy;
+they never fall back to UI-owned deletion if the service is unavailable. A
+native request first prepares a bounded plan under the existing Qt folder lock.
+A fresh original frontend child must then admit that exact plan before the
+service reserves any removal. The original two-second native permit is never
+extended to cover slow filesystem preparation.
+
+One pass considers at most 16 files from an index of at most 1 MiB and 1024
+entries, and verifies at most 64 MiB of content. Edited, linked, replaced and
+unindexed files remain intact. Download completion admits fixed work with a
+65-second opening grace; the folder lock is released while waiting, and any
+change to its frozen index or files keeps the original copies. The admitted
+pass can finish after the UI closes. Revoke stops new effects and remains
+unsettled until the original worker physically joins. After the grace and exact
+reopen, the actor durably marks effect start before releasing the original
+worker into execution. A missing start reply cannot authorize unlink. An admitted
+reservation without a committed start mark can settle as Kept from its retained
+original receipt only after physical join or exclusive-owner restart; cache
+totals are never reconstructed. Older reservations without this evidence remain
+conservative. A lost result after the start mark is terminal unknown for that
+original file/content identity, including after a rename or an unrelated index
+edit. Another request ID cannot clear that fence.
+The read-only `cache_maintenance_result` request accepts the original request ID
+and returns its bounded receipt; it cannot prepare, retry or authorize work.
+
 `hgs desktop registration --json` previews the current platform's per-user
-definition and exact configuration identity. It creates no files, contacts no
-service manager and enables no writer. Its `operation:preview` identifies this
+passive registration and includes a `readiness` probe for that exact binary and
+configuration. Run its `argv` directly with the two supplied `HGS_CONFIG_DIR`
+and `HGS_STATE_DIR` values, then require the returned configuration to equal
+`expected_configuration`. `lifecycle.ipc_ready` means the private endpoint and
+store are ready; it does not mean background writers are active. The same
+`lifecycle` object supplies the actual service PID, epoch and generation, plus
+per-component readiness. Its epoch changes on service restart. The registration's
+`session` object describes the graphical login environment needed by platform
+installers; it is a requirement, not a claim that the environment is present.
+
+`lifecycle.mode` reports the running command's `passive` or `background`
+selection independently of worker admission. On Linux/macOS, `registration --json
+--background` renders the explicit background variant without installing it;
+`registration mode-check --json` checks the actual installer caller ancestry and
+foreground terminal or installed frontend on Linux, macOS and Windows, without
+granting service ownership. Windows requires a retained installed frontend
+ancestor or an already attached visible foreground classic console; unverified
+Windows Terminal/ConPTY and headless callers are directed to Settings. This
+preflight does not enable Windows background registration or change a task.
+The [macOS ancestry boundary](macos-distribution.md) verifies Terminal's system
+login bridge and launchd PID 1; SSH through a foreign session process refuses.
+The maintained Linux helper's `status --json` reports the durable selected mode
+separately from the running mode and any pending restart/revoke transition.
+
+The preview also contains the per-user definition and exact configuration identity.
+It creates no files, contacts no service manager and enables no writer.
+Its `operation:preview` identifies this
 render-only operation; it makes no claim about OS registration. Maintained installer
 ownership checks and delegation are separate steps before using the definition.
+
+On Windows, `hgs desktop notification-registration install|status --json`
+manages only the owned `com.hgdev.hgs-tray` AUMID/COM registration. Install the
+passive service task first so the selected stable CLI matches the current
+installer. Status is metadata, not native notification readiness. The fixed
+cold activation entry refuses before configuration or owner acquisition. No
+worker repairs registration or enables background consent.
+
+Explicit removal uses `notification-registration remove --json --request-id UUID`
+only after the original selected service's settled manual revoke with that same
+UUID. The authenticated current-service reply must match configuration and
+original runtime epoch and have accepted/durable/revoked/checkpointed all true.
+Lost replies authorize read-only `revoke_status`, never a new revoke UUID.
+Unknown or retained offline state stays for inspection. UI-only uninstall keeps
+the service task, staged CLI and Toast identity; its separate UI login entry is
+removed normally. Active removal currently remains unavailable until root Windows Runtime drain
+attachment is integrated; metadata removal does not claim native history deletion.
 
 The proposed service names are `hgs-desktop.service` (systemd user),
 `com.hgdev.hgs-desktop` (LaunchAgent), and `hgs-desktop` (per-user Windows logon
@@ -5580,7 +6176,14 @@ configurations automatically. Windows definitions use the current SID,
 restarts one minute apart (the [Task Scheduler schema minimum](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-interval-restarttype-element)).
 Paths with environment-variable markers are refused on Windows because Task
 Scheduler expands them even inside quoted arguments. Linux permits three starts
-within five minutes and does not restart a startup refusal (exit 78). macOS adds
+within five minutes and does not restart a startup refusal (exit 78). The Linux
+unit is ordered after and is part of `graphical-session.target`, and is enabled
+for that target rather than `default.target`. Plasma and GNOME establish this
+session after importing the graphical environment into the user manager. Bare
+window managers without that integration must arrange a session target that
+pulls in `graphical-session.target`, or import their session environment and
+manually enable/start `hgs-desktop.service` for that login. Direct manual start
+of `graphical-session.target` itself can be refused by systemd. macOS adds
 the private `--launchd` argument to the exact registered form: permanent startup
 refusals print a diagnostic and exit successfully, so
 [`SuccessfulExit=false`](https://github.com/apple-oss-distributions/launchd/blob/main/man/launchd.plist.5)
@@ -5782,6 +6385,24 @@ supervises the worker; a client that sees `false` runs one `hgs swarm get`,
 which restarts an outdated worker as before. Writes, including the first
 `swarm initialize`, stay with `hgs swarm`.
 
+The `team` topic follows every team of the computer's team store:
+`{"op":"subscribe","topic":"team"}`, one per stream. Its rows are keyed like
+the organization's: `team:<id>` is the team's head `{id, name, lead, status,
+revision, updated}`, and `teams` is `{count, truncated}`. Every change of a team
+(a command, the dispatcher, a member's report) raises its `revision`, so a
+client reads a team again with `hgs team status`, `inbox` and `events` when its
+revision moved instead of polling them. At most 1000 heads go out, the most
+recently changed first; `truncated` says more exist. A worker thread reads them
+with one indexed query and never writes. It reads again when a stat of the
+store or its rollback journal changes and at least every 30 s, at most once a
+second. The first rows go out as a paged `snapshot`, a later change as one
+`delta` of the changed rows and removed keys. A delta the client is too far
+behind to take becomes `gap` (`overflow`) and a fresh snapshot once it caught
+up. A read that fails, such as a store held by a writer, sends a non-fatal
+`team_failed`. A peer whose `hello` does not list `team` answers the
+subscription with `unsupported_topic`; read its teams with `hgs team` as
+before.
+
 The stream checks its sources every 250 ms. It stats the bindings, read marks,
 notification preferences, waits, launches, renames, name routes, the archive
 folder and the DeepSeek and OpenCode bindings, and holds a read-only connection
@@ -5809,13 +6430,22 @@ are at most 64 KiB.
 The desktop runs one stream for each computer whose CLI prints the marker.
 While a computer's stream is live, the desktop stops polling that computer's
 listing and follows the selected session's Activity through the stream; the
-Processes tab keeps its own poll interval. When the stream offers the `git`
+Processes tab keeps its own poll interval. Until a newly selected session's
+first read arrives, each refresh also inspects it directly, and selecting the
+followed session anew subscribes again from its latest window, so Activity and
+Send never wait on the stream alone. When the stream offers the `git`
 topic, it also follows the checkout folders of that computer's sessions, the
 selected one first, then shown rows, at most 64, instead of starting
 `git-status` for each every 15 s. A followed value counts as checked every 15 s
 while the stream follows it; its remote's age keeps counting, so a remote shows
 verified for at most 60 s after its check. Refused folders, and all folders of
-a computer whose stream is not live, are polled as before. Listings are applied at most every
+a computer whose stream is not live, are polled as before. When the stream
+offers the `team` topic, the Team tab's reads of that computer (the team list,
+Waiting, and the watched team's status, inbox and feed) run when a team's
+revision moved, plus once a minute, instead of every 3 s; until the topic's
+first complete snapshot, after a `gap` or `team_failed`, while the stream is
+down, and on a peer without the topic they are polled every 3 s as before.
+Listings are applied at most every
 2 s, Activity within 50 ms. A stream that fails or stays silent for 30 s
 restarts after 5 s, 15 s, 60 s and then every 5 minutes, and the desktop polls
 meanwhile. `ZERUS_EVENT_STREAM=0` or the setting `dataPlane/eventStream=false`
@@ -5884,7 +6514,9 @@ enforced: a team without a configuration keeps today's flow.
   `bin`, `manifest` (another crate), `filters` and `skips` (up to 512 each),
   `qt-test` with `suites` run one after another in the same run and
   `functions` as `suite:function` (a plain name, or `function:datatag`, with
-  one suite).
+  one suite). A Qt test runs with `QT_FORCE_STDERR_LOGGING=1`: without a
+  console QtTest would log to the debugger, and the run's tail keeps each
+  suite's own lines (`FAIL!`, `Totals`).
 - `hgs test durations --record LOG --provider NAME` keeps the slowest measured
   time per target from CTest, QtTest, Cargo (and libtest JSON), unittest or
   pytest output, or a JSON object of test ids to seconds.
@@ -5948,9 +6580,55 @@ folder are decided at once as before.
   test queue (forced, never reused) on the merged commit. All green keeps the
   merge and accepts the task; any failure resets the lead branch to `prev`
   (only while it is still the merge) and sends the task back with the failed
-  suites, their records and the end of the failing log.
-- Every kept merge moves `merge_tested` and the bounded `merge_log`; a phase
-  build then checks only `hgs test affected MERGE_TESTED..HEAD`.
+  suites, their records and the end of the failing log. A selected suite whose
+  declared platforms exclude this computer is not queued here: with a
+  configured test runner of its class it is dispatched there and waited for as
+  before; without one the merge records it as "not run here: SUITE runs on
+  PLATFORMS; no runner of that class" and decides on the suites that ran. The
+  merge view, the feed and the merge log name both the suites that ran and the
+  ones not run here. Each kept merge advances the queue's tested point for the
+  suites that ran, or when nothing was selected; a suite not run here keeps its
+  own range open, so it cannot hold the tested point of the suites that ran, and
+  the phase build names it and that range. On Windows each queued command
+  reaches `cmd /D /S /C` as one unescaped string, so a provider command that
+  quotes its folder (`cd /d "tests" && ...`) runs as written; Linux and macOS
+  keep `sh -c`.
+- An entry whose `merged` is reachable from HEAD is never merged again: the
+  queue first tries the rollback
+  while HEAD is that merge; once HEAD moved it selects and runs the recorded
+  `prev..merged` tests on HEAD. Success keeps the merge normally; a test or
+  selection failure returns the task and records one typed untested merge range
+  on that task (not a suite in `merge_not_run`). Repeated returns widen the one
+  range. A later merge selects the union of its own files and open ranges on
+  its HEAD, so overlapping tests run once. A range closes only after every
+  affected suite ran successfully on a HEAD containing it, or an accepted phase
+  build proved that exact named range. A build says "untested merge of task #N,
+  range X..Y"; newer ranges not named by that build remain open. Selection and
+  build snapshots are bounded to one batch of 500 ranges; each task has at most
+  one persisted open range. Old synthetic `merge-N` records migrate with their
+  original start point. If selecting the tests or
+  reading the runner config fails while HEAD is still the merge, the queue rolls
+  it back at once and requeues it with the reason; a rolled-back entry retries
+  only when HEAD or the tests map changed, or when the lead accepts or retries
+  it. A failed rollback itself retries only for a changed HEAD or an explicit
+  lead accept/retry, even if the tests map changes. A second selection error on
+  such a retry returns the task. While a merge is testing, reject and cancel
+  first say "its tests run; wait for the merge queue's result". Otherwise they
+  are refused with "the merge is still in the lead branch; retry, or
+  revert it by hand" while the merge is reachable; once a reset or revert makes
+  it unreachable they clear the entry. Only a `merge-base --is-ancestor` exit of
+  1 means not reachable; an unreadable answer keeps the entry with its reason.
+  Saved `waiting` entries become `queued`; saved `reverting` entries are dropped
+  when the task is Pending or Cancelled, or the merge is gone, and otherwise
+  become queued. Reachable untested work is retained as a range. Queue waits
+  carry a serde-default typed reason; Busy filtering and inbox guidance never
+  inspect the wording of the diagnostic. Missing or future reason values use
+  generic guidance, so old saved states still load.
+- Each kept merge advances `merge_tested` for the suites that ran (or when
+  nothing was selected), and the bounded per-suite points keep a suite not run
+  here at its own last run. A phase build checks
+  `hgs test affected MERGE_TESTED..HEAD` and the not-run suites from their own
+  points to HEAD.
 - With the queue on, every hand-out tells the member to merge the lead branch
   into its folder before it starts (the git-merge-lead template).
 
@@ -5967,6 +6645,10 @@ provider without them is `android`), carried by every queued request.
   Any other goes only to an enabled runner of its class; with none, or with
   every such runner unreachable, it stays queued with the reason (`hgs team
   test --json` action `queue` shows it) and never runs on another platform.
+  The merge queue does not wait for such a suite when no runner of its class is
+  configured: it records it as not run here (see the merge queue above) and
+  decides on the suites that ran; a suite of this computer's class always runs
+  here.
 - The scheduler reaches a runner only through hgs's own SSH transport:
   `hgs @ALIAS test runner --json` (BatchMode, connect timeout, the Windows peer
   channel; the peer needs this hgs, marker `test-runner-v1`). It first asks
@@ -6041,7 +6723,10 @@ The full run happens only before a release: the owner hears its estimate from
 run. A team setting `full_tests` says who may start one (`never`, `ask` or
 `allowed`; `ask` by default), and the owner may grant one run bound to a
 release; `hgs team run` refuses a full-suite template without that grant and
-names the estimate and the command that asks. `hgs team status` shows the
+names the estimate and the command that asks. A `cargo-test` is the full suite
+only when it names no `filter`, `bin`, `package` and no non-empty `filters`:
+the request `hgs test affected` prints for a crate (its `filters`, `skips` and
+`manifest`) is narrowed; `skips` or a `manifest` alone are not. `hgs team status` shows the
 policy and an active grant. Zerus computes a task's affected set from its own
 diff and accepts its report only with that set green on the merging commit. Every
 test is weighed by real need, speed first (owner, 2026-10-31): a run earns
@@ -6049,3 +6734,89 @@ its place only if it can fail for the change; lint and screenshots ride on the
 integration's and the test's own run. A split keeps every test, counted before
 and after; a repeat becomes a case of a table test, and a test that guards
 nothing is removed with the reason in the report.
+
+### Iron rules
+
+Iron rules are stored by Rust at four cumulative levels: project, team, member,
+and session. A lower level adds requirements and cannot cancel a higher level.
+Each level allows at most 20 nonempty rules of 300 characters each. Team settings
+use `settings.iron_rules`; members use `iron_rules` in their plan or
+`members_update`. These fields default to empty for old records. `project_id`
+is the stable project identity; the legacy team `project` remains its label.
+Give teams a stable `project_id`; an old label resolves only when unique.
+
+Only the owner changes rules. A lead may change its team's rules, its project
+rules or a member session's rules with a verified, unused `owner_word` from the
+owner's recent message in that lead session (the same journal verification as
+phase approvals). Merely writing `by: human` from an agent does not authorize it.
+A member cannot edit any level. A settings or plan update that changes rules
+passes this gate too. The GUI edits project/session rules in Iron rules, team
+rules in Team settings and member additions in the member editor.
+
+`hgs [@host] rules get|set|migrate --json` is additive (`iron-rules-v1` in help).
+Input is one JSON object on stdin. Project input names `scope: "project"` and
+`project: "STABLE_ID"`. Session input names `scope: "session"`, `name`,
+`expected_run_id` and `expected_conversation_id`; all identities must match the
+current binding. Get returns `rules` and `revision`. Writes add a canonical
+`request_id`, `expected_revision` from get, and a bounded `rules` array. Owner
+writes use `by: "human"`; a lead also supplies `team` and `owner_word`.
+Project requests are replay-safe; session requests replay the last exact write,
+while stale revisions or replaced identities are refused. Project rows and
+request receipts live in `HGS_STATE_DIR/iron-rules.sqlite3`; session additions
+remain in the exact native binding; team/member additions remain in the team.
+Migration imports the GUI's `workspace/ironRules` once per project and computer.
+It never overwrites an existing Rust row, including an intentionally empty list.
+The GUI retains its old value as a backup until and after a confirmed receipt;
+a failed import remains retryable. Old CLIs retain the legacy per-send fallback.
+
+Rules accompany every team task, including a pipeline stage, regardless of the
+catalog's prompt order or disabled rules block. Claude Code receives all levels
+through root SessionStart `additionalContext` on startup, resume, clear and
+compact, combined with the hint/task commands in one JSON response. Ordinary
+messages omit the wrapper only after startup delivered the current effective
+rules for the selected project. Changed rules, a missing or mismatched project,
+or missing startup proof keep the fallback until the next successful start.
+The current Codex, DeepSeek, Kimi and OpenCode adapters retain per-send delivery;
+they have no equivalent verified startup/resume/clear/compact delivery path in
+this integration. SessionStart never injects rules into subagents or ordinary
+message hooks. Team terminal startup introductions also carry inherited rules.
+Remote task delivery reads the exact remote session's own rules before sending;
+an unreadable new peer refuses delivery rather than omitting its rules.
+
+For a remote session, the lead-local read-only resolver accepts `host` with the
+exact session identities in `rules get`. It joins indexed local team membership
+with the remote binding's own rules. Remote team Claude sessions retain per-send
+delivery: their host cannot independently restore the lead's team/member rules
+at startup. GUI project rules belong to this GUI computer's Rust project store;
+session writes go to the selected session's host. No rules synchronization or
+remote startup contract is implied by this resolver.
+
+Iron-rules compatibility and failure handling:
+- Use the public `hgs @host rules ... --json` route; forwarding probes
+  `iron-rules-v1` and never requests a terminal or agent launch. Windows uses
+  the guarded peer channel or a guarded SSH command.
+- A startup proof belongs to the exact run and conversation and is invalidated
+  at every accepted main SessionStart before resolution. Foreign starts cannot
+  invalidate the parent's proof. Resolution errors are logged without losing
+  the ordinary hint/task context; they keep per-send delivery.
+- The combined startup context is written and flushed before the confirmed
+  binding is published. Its rules proof is part of that same atomic record
+  update, with no later proof-only write after a fresh conversation is visible.
+  Early invalidation remains in place: failed output leaves no proof and does
+  not publish a fresh binding as started.
+- Claude Code's [hook output limit](https://code.claude.com/docs/en/hooks#json-output)
+  is 10,000 characters per context string. Zerus accepts startup proof only for
+  at most 6000 UTF-16 units of rules and 8000 units of combined context. Larger
+  lists retain the per-send fallback. All remote sessions retain this fallback,
+  including non-team Claude; local project rules remain mandatory even if the
+  peer has a different row under the same project identity.
+- A failed GUI migration keeps sending the legacy project rules and retries
+  migration later. It does not authorize dropping session or inherited rules.
+- For an ambiguous legacy project label, delivery fails closed and the team's
+  inbox shows an iron-rules blocker. The owner resolves it with
+  `hgs team settings --json`, giving the team's exact `team`, a stable
+  `project_id`, `by: "human"` and a canonical `request_id`. A lead cannot change
+  this association by claiming to be the owner.
+- An older hgs that rewrites a team record does not preserve unknown
+  `iron_rules`/`project_id` fields. Keep team writers on a rules-aware hgs;
+  additive deserialization alone cannot protect these fields from old writers.

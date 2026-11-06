@@ -1,5 +1,6 @@
 #pragma once
 #include <QHash>
+#include <QSet>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QWidget>
@@ -8,6 +9,7 @@
 
 class QVBoxLayout;
 class QScrollArea;
+class QKeyEvent;
 
 // WhiteWh fork: agent teams. A task's card (design/agent-teams S3): its status,
 // the problem with its actions, description, criteria, what it depends on and
@@ -22,6 +24,10 @@ public:
     int task() const { return m_task; }
     std::function<void()> back;
     std::function<void(const QString &operation, const QJsonObject &input)> act;
+    // Task 55: an action whose answer the card shows (a member's question):
+    // done(ok, message) once hgs answered. Without it, `act` is used.
+    using Done = std::function<void(bool ok, const QString &message)>;
+    std::function<void(const QString &operation, const QJsonObject &input, const Done &done)> actThen;
     std::function<void(int task)> openTask;
     // G1: open the sub-team a delegated task names.
     std::function<void(const QString &team)> openTeam;
@@ -36,6 +42,9 @@ public:
     std::function<void(int task, const RunsRead &done)> readTestRuns;
     std::function<void(const QString &record)> openTestRecord;
     static constexpr qint64 RunsStaleMs = 15000;
+protected:
+    // Esc closes the card, as its back button does.
+    void keyPressEvent(QKeyEvent *event) override;
 private:
     void readRuns();
     struct TestRuns { int task = 0; qint64 at = 0; bool loading = false; QJsonArray runs; QString error; quint64 generation = 0; };
@@ -51,6 +60,20 @@ private:
     int m_task = 0;
     bool m_dark = true;
     QString m_form;   // "reject" or "done" while an inline form is open
+    // Task 55: the owner's answer to each open question survives the card's
+    // rebuild on every poll (it was lost, so Send found nothing to send); an
+    // answer on its way sends nothing again; a refusal stays on its question.
+    QHash<QString, QString> m_answers;
+    QSet<QString> m_answering;
+    QHash<QString, QString> m_answerErrors;
+    bool m_focusAnswer = false;
+public:
+    // Task 55: the next build puts the cursor in the first answer field
+    // (Answer… in the team views opens the card for this).
+    void requestAnswerFocus() { m_focusAnswer = true; }
+    // The answer typed for a question (tests).
+    QString answerDraft(const QString &question) const { return m_answers.value(question); }
+private:
     QScrollArea *m_scroll;
     QWidget *m_footer;
     QVBoxLayout *m_layout;

@@ -46,6 +46,28 @@ fn a_sub_lead_takes_reports_only_while_it_is_one_and_never_in_a_cycle() {
 }
 
 #[test]
+fn a_sub_leads_member_interim_report_goes_to_the_sub_lead() {
+    let mut team = team_with_sub_lead();
+    let none = BTreeSet::new();
+    let mut events = Vec::new();
+    let tested = hand_out(&mut team, 2);
+    apply(
+        &mut team,
+        "report",
+        &json!({"task":2,"attempt":tested,"text":"Half the suite","interim":true}),
+        &Actor::Member("qa".into()),
+        &none,
+        &mut events,
+    )
+    .unwrap();
+    let theirs: Vec<_> = super::super::inbox::items_for(&team, "qalead").into_iter().filter(|item| item.kind == "interim_report").collect();
+    assert_eq!(theirs.len(), 1, "{theirs:?}");
+    assert_eq!(theirs[0].task, Some(2));
+    assert!(super::super::inbox::items(&team).iter().all(|item| item.kind != "interim_report"));
+    assert_eq!(events.iter().rev().find(|event| event.kind == "interim_report").unwrap().payload["to"], "QA lead");
+}
+
+#[test]
 fn a_sub_lead_answers_and_decides_its_reports_work_and_the_lead_hears_only_its_own() {
     let mut team = team_with_sub_lead();
     let none = BTreeSet::new();
@@ -156,10 +178,12 @@ fn scale_adds_a_roles_members_at_once_within_the_roster() {
     assert_eq!((added.state, added.draining), (MemberState::NotCreated, false));
     assert_eq!(team.member("backend2").unwrap().role, "Backend");
     assert_eq!(events.iter().filter(|event| event.kind == "member_added").count(), 2);
-    // The roster's cap counts them: two more do not fit and add nothing.
-    let error = apply(&mut team, "scale", &json!({"role":"Backend","agent":"codex","count":2}), &Actor::Human, &none, &mut events);
+    // The roster's cap counts them (not the lead): one more than the room
+    // left does not fit and adds nothing.
+    let room = team.settings.max_members - team.capped_members();
+    let error = apply(&mut team, "scale", &json!({"role":"Backend","agent":"codex","count":room + 1}), &Actor::Human, &none, &mut events);
     let error = error.unwrap_err().to_string();
-    assert!(error.contains("of 6 members"), "{error}");
+    assert!(error.contains("of 6 members besides the lead"), "{error}");
     assert!(team.member("backend3").is_none(), "a scale that does not fit adds nothing");
     // A role, an agent and a count are required; only the lead or you scale.
     for input in [
@@ -613,7 +637,7 @@ fn swapping_a_member_keeps_its_work_and_continues_the_open_attempt() {
     let error = apply(&mut team, "swap-member", &json!({"member":"dev"}), &Actor::Member("lead".into()), &none, &mut events)
         .unwrap_err()
         .to_string();
-    assert_eq!(error, "Only you swap a member; the lead needs your word");
+    assert_eq!(error, "Only you swap a member; the lead needs your word: propose {\"kind\":\"swap-member\"} as a card (hgs guide team-propose); the owner allows it with a click");
 }
 
 #[test]
@@ -871,4 +895,164 @@ fn a_draft_members_update_keeps_the_plans_member_checks() {
     assert!(error.contains("confirm_widening"), "{error}");
     apply(&mut team, "draft", &json!({"action":"create","approve":true,"confirm_widening":true}), &Actor::Human, &none, &mut events).unwrap();
     assert_eq!(team.status, TeamStatus::Running);
+}
+
+/// Owner feedback 2026-11-04 (14): a swap to a fresh session remembers the
+/// session it replaced, so the dispatcher sets it aside before the new
+/// session takes the member's name.
+#[test]
+fn a_swap_to_a_fresh_session_remembers_the_one_it_replaced() {
+    let mut team = running_team();
+    let none = BTreeSet::new();
+    let old = SessionRef { host: String::new(), name: "codex/x/dev".into(), run_id: "r1".into(), conversation_id: "c1".into() };
+    team.members.iter_mut().find(|member| member.id == "dev").unwrap().session = Some(old.clone());
+    apply(&mut team, "swap-member", &json!({"member":"dev","account":"additional"}), &Actor::Human, &none, &mut Vec::new()).unwrap();
+    let member = team.member("dev").unwrap();
+    assert_eq!(member.session, None);
+    assert!(member.launch_after_swap);
+    assert_eq!(member.replaced.as_ref(), Some(&old));
+    assert_eq!(member.account, "additional");
+}
+
+/// Owner feedback 2026-11-04 (12, 18): a swap card names what changes; an
+/// unknown field or an empty swap is refused, and one card swaps several
+/// members.
+#[test]
+fn a_swap_card_names_what_changes_and_may_swap_several_members() {
+    let mut team = running_team();
+    let none = BTreeSet::new();
+    let lead = Actor::Member("lead".into());
+    let propose = |team: &mut Team, input: Value| apply(team, "propose", &input, &lead, &none, &mut Vec::new());
+    let error = propose(&mut team, json!({"kind":"swap-member","reason":"r","member":"dev","with":{"account":"additional"}}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no field \"with\"") && error.contains("account"), "{error}");
+    let error = propose(&mut team, json!({"kind":"swap-member","reason":"r","member":"dev"})).unwrap_err().to_string();
+    assert!(error.contains("changes nothing") && error.contains("\"fresh\": true"), "{error}");
+    let error = propose(&mut team, json!({"kind":"swap-member","reason":"r","members":[{"id":"dev","acount":"x"}]}))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no field \"acount\""), "{error}");
+    assert!(team.proposals.is_empty(), "nothing was proposed");
+    // A fresh session with the same settings is said explicitly.
+    propose(&mut team, json!({"kind":"swap-member","reason":"r","member":"dev","fresh":true})).unwrap();
+    // One card for several members, each with its own change and prompt.
+    team.members.push(Member { id: "qa".into(), role: "QA".into(), agent: "claude".into(), ..Default::default() });
+    propose(
+        &mut team,
+        json!({"kind":"swap-member","reason":"move to additional","members":[
+            {"id":"dev","account":"additional"},{"id":"qa","account":"additional","prompt":"Test the menu"}]}),
+    )
+    .unwrap();
+    let card = team.proposals.last().unwrap();
+    assert_eq!(card["change"]["members"].as_array().map(Vec::len), Some(2), "{card}");
+    assert_eq!(card["member"]["id"], "dev");
+    assert_eq!(card["change"]["members"][1]["prompt"], "Test the menu");
+}
+
+/// Feedback 12: a swap's prompt changes the member's prompt.
+#[test]
+fn a_swap_changes_the_role_prompt() {
+    let mut team = running_team();
+    apply(&mut team, "swap-member", &json!({"member":"dev","prompt":"Review only"}), &Actor::Human, &BTreeSet::new(), &mut Vec::new()).unwrap();
+    assert_eq!(team.member("dev").unwrap().prompt, "Review only");
+}
+
+/// Owner feedback 2026-11-04 (6, 7): a draft changes one member without
+/// resending the list, and takes the plan mode.
+#[test]
+fn a_draft_changes_one_member_and_sets_the_plan_mode() {
+    let (mut team, _) = create("t", &json!({"name":"T","lead":{"id":"lead","agent":"claude"}})).unwrap();
+    team.status = TeamStatus::Draft;
+    team.draft = Some(Draft { revision: 1, ..Default::default() });
+    let none = BTreeSet::new();
+    let lead = Actor::Member("lead".into());
+    let update = |team: &mut Team, revision: u64, set: Value, actor: &Actor| {
+        apply(team, "draft", &json!({"action":"update","revision":revision,"set":set}), actor, &none, &mut Vec::new())
+    };
+    update(&mut team, 1, json!({"members":[{"id":"dev","role":"Backend","agent":"claude"},{"id":"qa","role":"QA","agent":"claude"}]}), &lead).unwrap();
+    // One member's model, a new member and a removal, by id.
+    update(&mut team, 2, json!({"members":{"dev":{"model":"opus","account":"additional"},"ux":{"role":"UX","agent":"kimi"},"qa":null}}), &lead).unwrap();
+    let ids: Vec<&str> = team.members.iter().map(|member| member.id.as_str()).collect();
+    assert_eq!(ids, ["lead", "dev", "ux"]);
+    let dev = team.member("dev").unwrap();
+    assert_eq!((dev.role.as_str(), dev.model.as_str(), dev.account.as_str()), ("Backend", "opus", "additional"));
+    let error = update(&mut team, 3, json!({"members":{"qa":null}}), &lead).unwrap_err().to_string();
+    assert!(error.contains("no member qa"), "{error}");
+    let error = update(&mut team, 3, json!({"members":{"dev":{"text":"x"}}}), &lead).unwrap_err().to_string();
+    assert!(error.contains("no field \"text\""), "{error}");
+    // The lead offers a plan mode; the owner chooses it.
+    update(&mut team, 3, json!({"plan_mode":"free","plan_mode_reason":"one-off"}), &lead).unwrap();
+    assert_eq!(team.plan_mode_offer, Some(PlanMode::Free));
+    update(&mut team, 4, json!({"plan_mode":"free"}), &Actor::Human).unwrap();
+    assert_eq!((team.plan_mode, team.plan_mode_offer), (PlanMode::Free, None));
+}
+
+/// Task #18 (owner, 2026-11-05): the New team form's first save is accepted as
+/// it sends it (the form's four settings only, its members and template tasks);
+/// a draft over its member limit is a preflight error and its create is refused
+/// naming the limit, never "Preflight: ok" beside a create that does nothing.
+#[test]
+fn a_draft_over_its_member_limit_is_refused_at_create_and_by_the_preflight() {
+    let (mut team, _) = create("t", &json!({"name":"T","lead":{"id":"lead","agent":"claude"}})).unwrap();
+    team.status = TeamStatus::Draft;
+    team.draft = Some(Draft { revision: 1, ..Default::default() });
+    let none = BTreeSet::new();
+    let members: Vec<Value> = (1..=3)
+        .map(|n| {
+            json!({"id":format!("dev-{n}"),"role":"Backend","agent":"claude","account":"","model":"","effort":"","permissions":"",
+                   "computer":"","folder":"shared","prompt":"Build it."})
+        })
+        .collect();
+    let set = json!({"goal":"Ship","addendum":"","members":members,
+        "tasks":[{"id":1,"title":"Plan","assignee":"lead","deps":[]},{"id":2,"title":"Build","assignee":"dev-1","deps":[{"task":1,"kind":"hard"}]}],
+        "settings":{"folder_policy":"auto","approval":"review","phase_approval":"auto","max_members":2}});
+    apply(&mut team, "draft", &json!({"action":"update","revision":1,"set":set}), &Actor::Human, &none, &mut Vec::new()).unwrap();
+    let validation = plan::validate(&team, &none);
+    assert!(
+        validation.errors.iter().any(|finding| finding.kind == "members" && finding.text.contains("over the team limit of 2")),
+        "{:?}",
+        validation.errors
+    );
+    assert!(validation.warnings.iter().all(|finding| finding.kind != "members"), "{:?}", validation.warnings);
+    let error = apply(&mut team, "draft", &json!({"action":"create"}), &Actor::Human, &none, &mut Vec::new()).unwrap_err().to_string();
+    assert!(error.contains("over the team limit of 2"), "{error}");
+    assert_eq!(team.status, TeamStatus::Draft);
+    // One member fewer: the same draft creates.
+    apply(&mut team, "draft", &json!({"action":"update","revision":2,"set":{"members":{"dev-3":null}}}), &Actor::Human, &none, &mut Vec::new()).unwrap();
+    let value = apply(&mut team, "draft", &json!({"action":"create"}), &Actor::Human, &none, &mut Vec::new()).unwrap();
+    assert_eq!(value["status"], "planning", "{value}");
+}
+
+/// Task #26: team 33fbafeb's lead drafted the catalog's Reviewer with its
+/// role's folder, `read_only`, and the draft was refused with "A member is
+/// invalid" and an example, naming no field; the reviewer had to be made
+/// shared. `read_only` is the shared folder with no own checkout, and a value
+/// the draft refuses names its member and its field.
+#[test]
+fn a_draft_member_takes_the_catalogs_read_only_folder_and_a_refusal_names_the_field() {
+    let (mut team, _) = create("t", &json!({"name":"T","lead":{"id":"lead","agent":"claude"}})).unwrap();
+    team.status = TeamStatus::Draft;
+    team.draft = Some(Draft { revision: 1, ..Default::default() });
+    team.settings.folder_policy = FolderPolicy::Auto;
+    let none = BTreeSet::new();
+    let mut events = Vec::new();
+    let lead = Actor::Member("lead".into());
+    let reviewer = json!({"action":"update","revision":1,"set":{"members":[
+        {"id":"merger","role":"Reviewer & Merger","agent":"claude","model":"claude-sonnet-5-5","folder":"read_only"}]}});
+    apply(&mut team, "draft", &reviewer, &lead, &none, &mut events).unwrap();
+    assert_eq!(team.member("merger").unwrap().folder, MemberFolder::Shared, "no own checkout");
+    // Written back, the folder reads as the shared folder it is.
+    assert_eq!(serde_json::to_value(team.member("merger").unwrap()).unwrap()["folder"], "shared");
+    // A folder the catalog does not know names the member and the field.
+    let revision = team.draft.as_ref().unwrap().revision;
+    let unknown = json!({"action":"update","revision":revision,"set":{"members":[
+        {"id":"merger","role":"Reviewer","agent":"claude","folder":"readonly"}]}});
+    let error = apply(&mut team, "draft", &unknown, &lead, &none, &mut events).unwrap_err().to_string();
+    assert!(error.contains("A member \"merger\" is invalid: field \"folder\": unknown variant `readonly`"), "{error}");
+    assert!(error.contains("`read_only`") || error.contains("`shared`"), "the accepted values are named: {error}");
+    // So does a task field.
+    let task = json!({"action":"update","revision":revision,"set":{"tasks":[{"id":1,"title":"Review","assignee":"merger","deps":"1"}]}});
+    let error = apply(&mut team, "draft", &task, &lead, &none, &mut events).unwrap_err().to_string();
+    assert!(error.contains("A task \"1\" is invalid: field \"deps\""), "{error}");
 }

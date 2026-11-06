@@ -17,8 +17,8 @@ const SUMMARY_CHARS: usize = 300;
 /// message never names it twice.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Item {
-    /// `report`, `question`, `permission`, `lead_task`, `stalled`, `budget`
-    /// or `task_waits` (spec 0: U45, U46, U48).
+    /// `report`, `question`, `permission`, `lead_task`, `stalled`, `budget`,
+    /// `interim_report`, `merge_waiting` or `task_waits` (spec 0: U45, U46, U48).
     pub kind: &'static str,
     pub key: String,
     pub task: Option<u32>,
@@ -119,7 +119,7 @@ fn reviewer_of(team: &Team, item: &Item) -> String {
         // #538 N3: a report a sub-lead may not accept is the lead's.
         ("report", Some(task)) if super::pipeline::lead_accepts_only(task) => team.lead.clone(),
         // The lead's own task has no reviewer: it stays the lead's.
-        ("report" | "question" | "stalled", Some(task)) if !task.assignee.is_empty() && task.assignee != team.lead => {
+        ("report" | "question" | "stalled" | "interim_report", Some(task)) if !task.assignee.is_empty() && task.assignee != team.lead => {
             team.reviewer_of(&task.assignee)
         }
         _ => team.lead.clone(),
@@ -131,16 +131,86 @@ fn all_items(team: &Team) -> Vec<Item> {
     // N5: a finished team has no open work, but the owner's decision on the
     // lead's proposal is still the lead's to read (spec 4).
     let finished = matches!(team.status, TeamStatus::Done | TeamStatus::Stopped);
-    if !active && !finished {
+    if !active && !finished && team.iron_rules_error.is_empty() {
         return Vec::new();
     }
     let mut items: Vec<Item> = Vec::new();
+    if !team.iron_rules_error.is_empty() {
+        items.push(Item { kind:"stalled", key:"iron_rules".into(), task:None, member:team.lead.clone(), since:team.iron_rules_error_at.unwrap_or_else(crate::state::now),
+            summary:"Iron rules block team delivery; the owner must select its project".into(),
+            detail:team.iron_rules_error.clone(),
+            command:format!("Owner: {{\"team\":\"{}\",\"project_id\":\"STABLE_ID\",\"by\":\"human\",\"request_id\":\"UUID\"}} | hgs team settings --json",team.id),
+            subagents:Value::Null });
+    }
+
+    // A queued merge that failed and was rolled back waits for the lead to fix
+    // the runner/tests map or to retry it.
+    if active {
+        for task in &team.tasks {
+            let Some(entry) = task.merge.as_ref().filter(|entry| {
+                entry.state == "queued"
+                    && !entry.note.is_empty()
+                    && entry.wait_reason != super::model::MergeWaitReason::Busy
+            }) else { continue };
+            let next = match entry.wait_reason {
+                super::model::MergeWaitReason::Rollback => "The merge could not be rolled back; revert it, then retry or reject.",
+                super::model::MergeWaitReason::Runners => "Fix the runner or machine config, then accept or retry the merge.",
+                super::model::MergeWaitReason::Selection => "Fix the tests map, then accept or retry the merge.",
+                super::model::MergeWaitReason::Ancestry => "Check the lead branch and git access, then accept or retry the merge.",
+                _ => "Fix the cause, then accept or retry the merge.",
+            };
+            items.push(Item {
+                subagents: Value::Null,
+                kind: "merge_waiting",
+                key: format!("merge_waiting:{}:{}", task.id, entry.commit),
+                task: Some(task.id),
+                member: team.name_of(&entry.author),
+                since: entry.at,
+                summary: summary(&format!("#{} merge waits: {}", task.id, entry.note)),
+                command: format!(
+                    "{} | hgs team retry --json",
+                    json!({"request_id":PLACEHOLDER,"team":team.id,"task":task.id})
+                ),
+                detail: format!("{} {next}", entry.note),
+            });
+        }
+    }
+    // A rework keeps its member indefinitely. Show the wait even when that
+    // member has an approval or usage limit rather than a stored task wait.
+    for task in team.tasks.iter().filter(|task| active && task.rework() && task.status == TaskStatus::Pending
+        && task.hold.is_none() && task.waits.as_ref().is_none_or(|wait| wait.waits_for == "member")) {
+        let unavailable = team.member(&task.assignee).is_some_and(|member| {
+            matches!(member.state, MemberState::Removed | MemberState::Paused) || member.session.is_none()
+                || member.limited.is_some() || member.stuck.is_some() || member.seen.is_some_and(|seen| !seen.live)
+                || matches!(member.seen_phase.as_str(), "approval" | "question" | "input" | "error" | "working" | "tool" | "compacting")
+                || matches!(member.seen_activity.as_str(), "busy" | "attention" | "background")
+        });
+        if !unavailable { continue; }
+        let since = task.rework_since.unwrap();
+        let minutes = ((crate::state::now() - since) / 60.0).max(0.0).floor() as u64;
+        items.push(Item {
+            subagents: Value::Null,
+            kind: "rework_waits",
+            key: format!("rework_waits:{}:{since}", task.id),
+            task: Some(task.id),
+            member: team.name_of(&task.assignee),
+            since,
+            summary: format!("#{} waits for its member, {minutes} min", task.id),
+            command: format!("{} | hgs team reassign --json",
+                json!({"request_id":PLACEHOLDER,"team":team.id,"task":task.id,"member":"MEMBER"})),
+            detail: format!("{} keeps this rework without a time limit. Wait for that member or explicitly reassign the task. {}",
+                team.name_of(&task.assignee), task.waits.as_ref().map(|wait| wait.reason.as_str()).unwrap_or_default()).trim_end().to_owned(),
+        });
+    }
     // #752: two or more members in one folder build each other's half-done
     // edits; the lead proposes the build broker once (a switch card), and a
     // card the owner denied is not proposed again.
     let proposed = team.proposals.iter().any(|proposal| proposal["kind"] == "switch-setting" && proposal["change"]["setting"] == "build_broker");
     if active && !team.settings.build_broker && !proposed {
-        if let Some((folder, members)) = super::broker::shared_folders(team).into_iter().next() {
+        // Feedback 19: only a folder with something to build gets the offer.
+        if let Some((folder, members)) =
+            super::broker::shared_folders(team).into_iter().find(|(folder, _)| super::broker::builds(std::path::Path::new(folder)))
+        {
             let names: Vec<String> = members.iter().map(|id| team.name_of(id)).collect();
             items.push(Item {
                 subagents: Value::Null,
@@ -190,6 +260,7 @@ fn all_items(team: &Team) -> Vec<Item> {
     // waits for nobody.
     for task in team.tasks.iter().filter(|_| active).filter(|task| task.status == TaskStatus::Pending) {
         let Some(wait) = task.waits.as_ref().filter(|wait| !wait.running()) else { continue };
+        if task.rework() && wait.waits_for == "member" { continue; }
         let attempt = task.attempts.iter().rev().find(|attempt| wait.attempt > 0 && attempt.n == wait.attempt);
         let member = match attempt {
             Some(attempt) => team.name_of(&attempt.member),
@@ -514,7 +585,8 @@ fn all_items(team: &Team) -> Vec<Item> {
         .filter(|proposal| matches!(proposal["state"].as_str(), Some("accepted") | Some("rejected") | Some("answered")))
         .collect();
     let decided_at = |proposal: &Value| proposal["decided_at"].as_f64().or(proposal["at"].as_f64()).unwrap_or_default();
-    decided.sort_by(|a, b| decided_at(b).total_cmp(&decided_at(a)));
+    // A stable order: proposals decided in one go keep their places.
+    decided.sort_by(|a, b| decided_at(b).total_cmp(&decided_at(a)).then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
     for proposal in decided.into_iter().take(DECIDED_PROPOSALS) {
         let id = proposal["id"].as_str().unwrap_or_default().to_owned();
         let state = proposal["state"].as_str().unwrap_or_default().to_owned();
@@ -692,6 +764,25 @@ fn all_items(team: &Team) -> Vec<Item> {
                 }
             }
         }
+        // Owner (2026-11-01): an interim report (progress or a question) keeps
+        // its attempt open; the lead reads it here, the owner only in the feed.
+        if task.status == TaskStatus::InProgress {
+            if let Some(attempt) = task.open_attempt() {
+                if let Some(interim) = &attempt.interim {
+                    items.push(Item {
+                        subagents: Value::Null,
+                        kind: "interim_report",
+                        key: format!("interim:{}:{}", attempt.id, interim.at),
+                        task: Some(task.id),
+                        member: team.name_of(&attempt.member),
+                        since: interim.at,
+                        summary: summary(&format!("Interim: {}", interim.text)),
+                        command: format!("{} | hgs team status --json", json!({"team":team.id})),
+                        detail: interim.text.clone(),
+                    });
+                }
+            }
+        }
         // The lead's own task: handed out without a message, reported and
         // accepted in one step (C1).
         if task.status == TaskStatus::InProgress {
@@ -808,12 +899,42 @@ fn all_items(team: &Team) -> Vec<Item> {
             subagents: if pending.card["subagents"].is_array() { pending.card["subagents"].clone() } else { Value::Null },
         });
     }
+    // A request only the member's Terminal takes (Kimi's Edit and Write
+    // approvals): the lead cannot answer it, so it says who can and where.
+    for member in team.members.iter().filter(|member| member.id != team.lead) {
+        let Some(asked) = &member.terminal_question else { continue };
+        let name = team.name_of(&member.id);
+        items.push(Item {
+            subagents: Value::Null,
+            kind: "terminal_question",
+            key: format!("terminal_question:{}:{}", member.id, asked.question_id),
+            task: None,
+            member: name.clone(),
+            since: asked.at,
+            summary: summary(&format!("{name} waits for an answer only its Terminal takes: {}", terminal_title(asked))),
+            command: format!("{} | hgs team status --json", json!({"team":team.id})),
+            detail: format!(
+                "Zerus cannot answer it, so neither can you: {} Tell the owner to open {name}'s Terminal and answer it there; \
+                 the member continues once it is answered.",
+                asked.card["answer_unavailable_reason"].as_str().unwrap_or("Answer it in Terminal.")
+            ),
+        });
+    }
     // U20: a delivered attempt whose turn ended long ago and still has no
-    // report is an item, whatever the capture did.
+    // report is an item, whatever the capture did. The owner (2026-11-01):
+    // waiting for the answer to the member's own question or for its Background
+    // work is not a stall, so that wait is no missing report; the budget or the
+    // block timeout reaches the lead as the blocked message instead.
     let now = crate::state::now();
     for task in &team.tasks {
         let Some(attempt) = task.open_attempt() else { continue };
         if attempt.member == team.lead || attempt.report.is_some() {
+            continue;
+        }
+        if attempt.open_question().is_some() || attempt.blocked_since.is_some() {
+            continue;
+        }
+        if team.member(&attempt.member).is_some_and(|member| member.background_since.is_some()) {
             continue;
         }
         let Some(ended) = attempt.turn_ended_at else { continue };
@@ -861,6 +982,15 @@ fn all_items(team: &Team) -> Vec<Item> {
     items.sort_by(|a, b| a.since.total_cmp(&b.since).then_with(|| a.key.cmp(&b.key)));
     items.truncate(ITEM_LIMIT);
     items
+}
+
+/// What a Terminal-only request asks: its tool and title ("Edit: Apply these
+/// edits?").
+pub(crate) fn terminal_title(asked: &PendingQuestion) -> String {
+    let question = &asked.card["questions"][0];
+    let header = question["header"].as_str().unwrap_or_default();
+    let title = question["question"].as_str().unwrap_or("a permission request");
+    if header.is_empty() { title.to_owned() } else { format!("{header}: {title}") }
 }
 
 impl PendingQuestion {
@@ -925,18 +1055,59 @@ fn local_time(at: f64) -> String {
         .unwrap_or_else(|| format!("{at:.0}"))
 }
 
-/// The single message that lists the lead's new items (C2).
+/// An item that stops its member until the lead answers it.
+pub(crate) fn blocks_member(item: &Item) -> bool {
+    matches!(item.kind, "permission" | "question")
+}
+
+/// The owner, 2026-11-05: a lead answered a member's permissions late and
+/// left a question unanswered among many reports. A permission or question
+/// the lead was told of and still has not answered after this long is told
+/// once more, when the lead is free.
+pub(crate) const REMIND_BLOCKING_SECONDS: f64 = 180.0;
+
+/// The told permissions and questions still open past the reminder time and
+/// not reminded yet.
+pub(crate) fn overdue(items: &[Item], told: &[String], now: f64) -> Vec<Item> {
+    items
+        .iter()
+        .filter(|item| blocks_member(item) && now - item.since >= REMIND_BLOCKING_SECONDS)
+        .filter(|item| told.contains(&item.key) && !told.contains(&format!("remind:{}", item.key)))
+        .cloned()
+        .collect()
+}
+
+/// The single message that lists the lead's new items (C2): what stops a
+/// member first, then the rest, each part oldest first.
 pub(crate) fn text(team: &Team, items: &[Item], now: f64) -> String {
+    text_with(team, items, &[], now)
+}
+
+/// `text`, with `again` the overdue items told once more.
+pub(crate) fn text_with(team: &Team, items: &[Item], again: &[Item], now: f64) -> String {
+    let mut ordered: Vec<(&Item, bool)> = again.iter().map(|item| (item, true)).collect();
+    ordered.extend(items.iter().filter(|item| !again.iter().any(|old| old.key == item.key)).map(|item| (item, false)));
+    ordered.sort_by(|(a, _), (b, _)| blocks_member(b).cmp(&blocks_member(a)).then(a.since.total_cmp(&b.since)));
+    let blocking = ordered.iter().filter(|(item, _)| blocks_member(item)).count();
     let mut text = format!(
-        "[Zerus team \u{b7} from: Zerus \u{b7} inbox]\nTeam: {}. {} item(s) wait for you, oldest first:\n",
+        "[Zerus team \u{b7} from: Zerus \u{b7} inbox]\nTeam: {}. {} item(s) wait for you{}:\n",
         team.name,
-        items.len()
+        ordered.len(),
+        if blocking > 0 {
+            format!("; the {blocking} permission(s) and question(s) first: each stops its member until you answer it")
+        } else {
+            ", oldest first".to_owned()
+        }
     );
-    for (index, item) in items.iter().take(MESSAGE_ITEMS).enumerate() {
+    for (index, (item, reminded)) in ordered.iter().take(MESSAGE_ITEMS).enumerate() {
+        let item = *item;
+        if *reminded {
+            text += &format!("\n{}. STILL UNANSWERED, told before:", index + 1);
+        }
         let task = item.task.map(|task| format!("task #{task} \u{b7} ")).unwrap_or_default();
         text += &format!(
-            "\n{}. {} \u{b7} {task}{} \u{b7} {}\n   {}\n",
-            index + 1,
+            "{}{} \u{b7} {task}{} \u{b7} {}\n   {}\n",
+            if *reminded { " ".to_owned() } else { format!("\n{}. ", index + 1) },
             item,
             item.member,
             age(now, item.since),
@@ -957,8 +1128,13 @@ pub(crate) fn text(team: &Team, items: &[Item], now: f64) -> String {
             }
         }
     }
-    if items.len() > MESSAGE_ITEMS {
-        text += &format!("\n[{} more item(s); hgs team inbox --json lists them all]\n", items.len() - MESSAGE_ITEMS);
+    if ordered.len() > MESSAGE_ITEMS {
+        text += &format!("\n[{} more item(s); hgs team inbox --json lists them all]\n", ordered.len() - MESSAGE_ITEMS);
+    }
+    if blocking > 0 {
+        text += "\nAnswer every permission and question before you end your turn, and check that each answer \
+                 went through. One Zerus refuses as Terminal-only goes to the owner by itself: tell the owner in \
+                 your reply which member waits in its Terminal.\n";
     }
     text += &format!(
         "\nAll items: {} | hgs team inbox --json\n\
@@ -1074,7 +1250,26 @@ pub(crate) fn mark_told(told: &mut Vec<String>, named: &[Item], open: &std::coll
             told.push(item.key.clone());
         }
     }
-    told.retain(|key| open.contains(key));
+    // Owner feedback 2026-11-04 (20): a decided proposal is final. Only the
+    // latest few are listed, so one could leave the list and come back when
+    // several were decided at once; forgetting it then repeated the whole
+    // batch to the lead. Its key is kept (the newest 200) while other items
+    // are forgotten once they close, so an item that opens again is new.
+    // A reminder's mark stays while its item is open.
+    told.retain(|key| {
+        open.contains(key) || key.starts_with("proposal:") || key.strip_prefix("remind:").is_some_and(|item| open.contains(item))
+    });
+    let decided = told.iter().filter(|key| key.starts_with("proposal:")).count();
+    if decided > 200 {
+        let mut drop = decided - 200;
+        told.retain(|key| {
+            if drop > 0 && key.starts_with("proposal:") && !open.contains(key) {
+                drop -= 1;
+                return false;
+            }
+            true
+        });
+    }
 }
 
 /// The reports the owner's attention list shows: undecided for at least
@@ -1168,6 +1363,29 @@ pub(crate) fn attention(team: &Team, now: f64) -> Vec<Value> {
             }
             out.push(item);
         }
+    }
+    // The owner, 2026-11-05: a running team whose lead's session stopped has
+    // nobody to read its reports or hand out its tasks; only the owner can
+    // resume it (or restart_crashed does, on by default).
+    if team.status == TeamStatus::Running {
+        if let Some(lead) = team.member(&team.lead).filter(|lead| lead.state == MemberState::Active && lead.session.is_some()) {
+            if let Some(seen) = lead.seen.filter(|seen| !seen.live) {
+                out.push(json!({"kind":"lead_stopped","member":team.role_of(&lead.id),"member_id":lead.id,"since":seen.at,
+                    "minutes":((now - seen.at).max(0.0) / 60.0).round() as u64,
+                    "summary":format!("The lead's session stopped: nobody reads reports or hands out tasks. Resume {}{}",
+                        lead.session.as_ref().map(|session| session.name.as_str()).unwrap_or_default(),
+                        if team.settings.restart_crashed { "" } else { " (or turn on restart_crashed)" })}));
+            }
+        }
+    }
+    // A request only the member's Terminal takes waits for the owner at once:
+    // nobody else can answer it.
+    for member in &team.members {
+        let Some(asked) = &member.terminal_question else { continue };
+        let name = team.name_of(&member.id);
+        out.push(json!({"kind":"permission_terminal","member":team.role_of(&member.id),"member_id":member.id,
+            "since":asked.at,"minutes":((now - asked.at).max(0.0) / 60.0).round() as u64,
+            "summary":format!("{name} waits for your answer in its Terminal: {}", terminal_title(asked))}));
     }
     out.extend(phase_items);
     // U63 (owner, 2026-10-31): a phase ready for the owner's acceptance.
@@ -1525,6 +1743,57 @@ mod tests {
         assert!(late.iter().any(|item| item["kind"] == "report"), "{late:?}");
     }
 
+    /// The owner, 2026-11-04: a Kimi Edit approval waited half an hour with
+    /// an idle lead. Zerus cannot answer it, so it is the lead's item naming
+    /// who can and the owner's at once, never silence.
+    #[test]
+    fn a_request_only_the_terminal_takes_reaches_the_lead_and_the_owner_at_once() {
+        let mut team = team();
+        let now = 5_000.0;
+        let card = json!({"question_id":"k1","question_hash":"hk","approval":true,"can_answer":false,
+            "answer_unavailable_reason":"Zerus answers only Kimi's Bash command approvals here. Answer this request in Terminal.",
+            "questions":[{"id":"approval","header":"Edit","question":"Apply these edits?","options":[]}]});
+        team.members.iter_mut().find(|member| member.id == "dev").unwrap().terminal_question =
+            Some(PendingQuestion { question_id: "k1".into(), question_hash: "hk".into(), approval: true, at: now - 60.0, card });
+        let items = super::items(&team);
+        let item = items.iter().find(|item| item.kind == "terminal_question").expect("the lead hears of it");
+        assert!(item.summary.contains("dev (Backend)") && item.summary.contains("Edit: Apply these edits?"), "{}", item.summary);
+        assert!(item.detail.contains("Terminal") && item.detail.contains("Bash command approvals"), "{}", item.detail);
+        assert!(!item.command.contains("hgs team answer"), "the lead cannot answer it: {}", item.command);
+        // The owner sees it at once, without the permission reminder.
+        let attention = super::attention(&team, now);
+        let found = attention.iter().find(|item| item["kind"] == "permission_terminal").expect("the owner sees it");
+        assert_eq!(found["member_id"], "dev");
+        assert!(found["summary"].as_str().unwrap().contains("in its Terminal"), "{found}");
+        let waiting = super::super::owner_waiting::items(std::slice::from_ref(&team), now);
+        let listed = waiting.iter().find(|item| item["kind"] == "permission_escalated").expect("in the owner's list");
+        assert_eq!(listed["action"], "open_terminal");
+        // No request, no item.
+        team.members.iter_mut().find(|member| member.id == "dev").unwrap().terminal_question = None;
+        assert!(!super::items(&team).iter().any(|item| item.kind == "terminal_question"));
+        assert!(!super::attention(&team, now).iter().any(|item| item["kind"] == "permission_terminal"));
+    }
+
+    /// The owner, 2026-11-05: the lead's session stopped and the team still
+    /// showed Running; nobody read reports. The owner sees it at once.
+    #[test]
+    fn a_stopped_lead_waits_for_the_owner_at_once() {
+        let mut team = team();
+        let now = 5_000.0;
+        team.members.iter_mut().find(|member| member.id == "lead").unwrap().seen = Some(MemberSeen { at: now - 120.0, live: false });
+        // Off, the item names the setting that would restart the lead.
+        team.settings.restart_crashed = false;
+        let attention = super::attention(&team, now);
+        let found = attention.iter().find(|item| item["kind"] == "lead_stopped").expect("the owner sees the stopped lead");
+        assert_eq!(found["minutes"], 2);
+        assert!(found["summary"].as_str().unwrap().contains("restart_crashed"), "{found}");
+        let waiting = super::super::owner_waiting::items(std::slice::from_ref(&team), now);
+        assert!(waiting.iter().any(|item| item["kind"] == "lead_stopped" && item["action"] == "resume_lead"), "{waiting:?}");
+        // A live lead, or a paused team, is no item.
+        team.members.iter_mut().find(|member| member.id == "lead").unwrap().seen = Some(MemberSeen { at: now, live: true });
+        assert!(!super::attention(&team, now).iter().any(|item| item["kind"] == "lead_stopped"));
+    }
+
     #[test]
     fn a_permission_request_is_answerable_from_the_inbox() {
         let mut team = team();
@@ -1565,7 +1834,8 @@ mod tests {
         let items = super::items(&team);
         let text = super::text(&team, &items, 1200.0);
         assert!(text.contains("from: Zerus \u{b7} inbox") && text.contains("2 item(s)"), "{text}");
-        assert!(text.contains("1. report") && text.contains("2. question"), "{text}");
+        // The question stops its member: it comes before the older report.
+        assert!(text.contains("1. question") && text.contains("2. report"), "{text}");
         assert!(text.contains("10 min") && text.contains("5 min"), "{text}");
         assert!(text.contains("Done and checked") && text.contains("Which database?"), "{text}");
         assert!(text.contains("hgs team accept --json") && text.contains("hgs team reply --json"), "{text}");
@@ -1776,5 +2046,27 @@ mod tests {
         // The record the desktop answers from carries the questions and Other.
         let record = super::super::dispatcher::permission_record(team.member(&lead).unwrap().pending.as_ref().unwrap());
         assert_eq!(record["questions"], card["questions"]);
+    }
+}
+
+#[cfg(test)]
+mod told_tests {
+    use super::*;
+
+    fn item(key: &str) -> Item {
+        Item { subagents: Value::Null, kind: "proposal_decided", key: key.into(), task: None, member: String::new(), since: 0.0,
+            summary: String::new(), command: String::new(), detail: String::new() }
+    }
+
+    /// Owner feedback 2026-11-04 (20): a decided proposal told once is not
+    /// told again when it leaves the listed few and comes back.
+    #[test]
+    fn a_told_decision_stays_told_after_it_leaves_the_list() {
+        let mut told = Vec::new();
+        let open: std::collections::BTreeSet<String> = ["proposal:p1".to_owned(), "report:1".to_owned()].into();
+        mark_told(&mut told, &[item("proposal:p1"), item("report:1")], &open);
+        // Both leave the open list: the report is forgotten, the decision kept.
+        mark_told(&mut told, &[], &Default::default());
+        assert_eq!(told, vec!["proposal:p1".to_owned()]);
     }
 }

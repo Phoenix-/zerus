@@ -281,6 +281,55 @@ fn adding_a_member_whose_folder_breaks_the_policy_is_refused() {
     });
 }
 
+/// Task #48: in a sandbox every refused store write is the sandbox's, whatever
+/// the error says (Codex's other user meets a private-folder check, not a
+/// read-only database), so the member's request waits in its folder.
+#[test]
+fn a_sandbox_queues_whatever_blocked_its_write() {
+    let error = anyhow::anyhow!("Missing team store parent: the folder is not private to this user");
+    assert!(!super::read_only(&error), "outside a sandbox an unrelated error is the error");
+    crate::platform::set_test_sandboxed(Some(true));
+    let queued = super::read_only(&error);
+    crate::platform::set_test_sandboxed(None);
+    assert!(queued);
+}
+
+/// Task #28 (5): team 33fbafeb's dsh member asked for a worktree got one; its
+/// sandbox could not write the git metadata (in the main checkout's `.git`),
+/// and the preflight only warned. A dsh member's own folder is a clone now,
+/// under the worktree policy too; another agent keeps its worktree.
+#[test]
+fn a_deepseek_member_given_a_worktree_gets_a_clone() {
+    use crate::state::teams::model::{FolderPolicy, MemberFolder};
+    let dir = tempfile::tempdir().unwrap();
+    crate::state::with_test_state_root(dir.path(), || {
+        let mut store = Store::open(true).unwrap();
+        let mut team = running_team();
+        team.settings.folder_policy = FolderPolicy::Worktree;
+        let id = team.id.clone();
+        store.create("11111111-1111-4111-8111-111111111111", &json!({}), team, vec![]).unwrap();
+        run(
+            "add-member",
+            &json!({"request_id":"22222222-2222-4222-8222-222222222222","team":id,"by":"human",
+                "member":{"id":"ui2","role":"Frontend","agent":"dsh","model":"deepseek-flash","folder":"worktree"}}),
+            false,
+        )
+        .unwrap();
+        run(
+            "add-member",
+            &json!({"request_id":"33333333-3333-4333-8333-333333333333","team":id,"by":"human",
+                "member":{"id":"ops","role":"Ops","agent":"codex","folder":"worktree"}}),
+            false,
+        )
+        .unwrap();
+        let saved = Store::open(false).unwrap().load(&id).unwrap().unwrap();
+        assert_eq!(saved.member("ui2").unwrap().folder, MemberFolder::Clone);
+        assert_eq!(saved.member("ops").unwrap().folder, MemberFolder::Worktree);
+        let found = super::super::plan::validate(&saved, &Default::default());
+        assert!(!found.warnings.iter().any(|finding| finding.text.contains("cannot write its git metadata")), "{:?}", found.warnings);
+    });
+}
+
 /// N39/F1.3: extend keeps a folder or policy mismatch instead of dropping
 /// it (it names no task), so the phase that cannot run is not added.
 #[test]
@@ -580,6 +629,45 @@ fn the_leads_answer_reaches_the_members_subagent_card() {
         assert_eq!(answer.1["expected_question_hash"], card["question_hash"]);
         assert_eq!(answer.1["answers"][0]["selected_option_ids"], json!(["1"]));
         assert_eq!(answer.1["expected_run_id"], "r1");
+    });
+}
+
+/// The owner, 2026-11-05: Kimi refused the lead's answer ("Another Kimi
+/// request is waiting. Answer in Terminal.") and the request stayed in the
+/// lead's inbox, which could never answer it. It moves to the owner.
+#[test]
+fn an_answer_only_the_terminal_takes_moves_the_request_to_the_owner() {
+    use crate::state::teams::model::{PendingQuestion, SessionRef};
+    let (mut team, _, _) = review_team();
+    let card = json!({"question_id":"k1","question_hash":"hk","approval":true,"can_answer":true,
+        "questions":[{"id":"approval","header":"Bash","question":"Run this command?","options":[{"id":"1","label":"Approve once"}]}]});
+    {
+        let dev = team.members.iter_mut().find(|member| member.id == "dev").unwrap();
+        dev.session = Some(SessionRef { name: "kimi/x/dev".into(), run_id: "r1".into(), conversation_id: "c".into(), ..Default::default() });
+        dev.pending = Some(PendingQuestion { question_id: "k1".into(), question_hash: "hk".into(), approval: true, at: 1.0, card: card.clone() });
+    }
+    let id = team.id.clone();
+    with_review_team(&team, || {
+        let inspected = json!({"pending_questions":[card.clone()]}).to_string();
+        super::super::dispatcher::set_fake_hgs(Some(Box::new(move |_, args: &[&str], _: Option<&Value>| {
+            Ok(match args.first().copied() {
+                Some("inspect") => super::super::dispatcher::fake_output(0, &inspected, ""),
+                _ => super::super::dispatcher::fake_output(1, "", "Another Kimi request is waiting. Answer in Terminal."),
+            })
+        })));
+        let result = as_lead(|| {
+            call("answer", json!({"member":"dev","question_id":"k1","expected_question_hash":"hk",
+                "answers":[{"question_id":"approval","selected_option_ids":["1"]}]}))
+        });
+        super::super::dispatcher::set_fake_hgs(None);
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Nothing was answered") && error.contains("owner"), "{error}");
+        let after = Store::open(false).unwrap().load(&id).unwrap().unwrap();
+        let dev = after.members.iter().find(|member| member.id == "dev").unwrap();
+        assert!(dev.pending.is_none());
+        let moved = dev.terminal_question.as_ref().expect("the owner's now");
+        assert_eq!((moved.question_id.as_str(), moved.card["can_answer"].as_bool()), ("k1", Some(false)));
+        assert!(super::super::inbox::attention(&after, 10.0).iter().any(|item| item["kind"] == "permission_terminal"));
     });
 }
 
@@ -944,6 +1032,10 @@ fn draft_get_returns_the_revision_and_preflight() {
     assert_eq!(get["revision"], 1);
     assert_eq!(get["draft"]["revision"], 1);
     assert!(get["preflight"]["errors"].is_array());
+    // Feedback 2026-11-04 (5): the answer carries what the draft holds.
+    assert_eq!(get["fields"]["members"][0]["id"], "lead", "{get}");
+    assert!(get["fields"]["settings"]["max_members"].is_u64(), "{get}");
+    assert!(get["fields"]["tasks"].is_array() && get["fields"]["goal"].is_string(), "{get}");
 }
 
 /// N3/C6: the owner paths that create a team or change the catalog have a
@@ -969,9 +1061,13 @@ fn the_create_and_catalog_owner_paths_refuse_an_agent_session() {
             let error = format!("{:#}", run("create", &input, false).unwrap_err());
             assert!(error.contains("An agent session cannot act as the owner"), "{error}");
         }
-        // Without "by":"human" the catalog command is not the owner's at all.
-        set_test_caller_identities(Some((None, None, None)));
+        // Without "by" an agent session reads the catalog as itself, and the
+        // owner's own shell (outside every session) is the owner (feedback 17).
+        set_test_caller_identities(Some((None, Some("hgs/x/dev".to_owned()), None)));
         assert!(!super::catalog_owner(&json!({})).unwrap());
+        set_test_caller_identities(Some((None, None, None)));
+        assert!(super::catalog_owner(&json!({})).unwrap());
+        assert!(!super::catalog_owner(&json!({"by":"lead"})).unwrap());
         // Outside every session you create the team and reach the owner path.
         assert!(super::catalog_owner(&json!({"by":"human"})).unwrap());
         let created = run("create", &input, false).unwrap();
@@ -1059,7 +1155,9 @@ fn every_stdin_json_reader_drops_a_bom() {
     assert_eq!(parsed["text"], "hi");
     assert!(serde_json::from_slice::<Value>(&bom("{}")).is_err(), "serde refuses a BOM, which is the bug");
     // Streams and framed protocols that never parse JSON from stdin.
-    let streams = ["peer_channel.rs", "screen/mod.rs", "platform/windows.rs", "cli.rs", "desktop/feed/io.rs"];
+    let streams = ["peer_channel.rs", "screen/mod.rs", "platform/windows.rs", "cli.rs", "desktop/feed/io.rs",
+        // A length-framed request between Zerus's own processes, not typed JSON.
+        "desktop/windows_registration/native.rs"];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = vec![root.clone()];
     let mut missing = Vec::new();
@@ -1565,7 +1663,10 @@ fn only_the_owner_outside_every_session_starts_a_draft() {
     for (record, dsh, env, run) in [(true, false, false, false), (false, true, false, false), (false, false, true, false), (false, false, false, true)] {
         assert!(owner_without_team(&owner, record, dsh, env, run).is_err(), "{record} {dsh} {env} {run}");
     }
-    assert!(owner_without_team(&json!({}), false, false, false, false).is_err());
+    // Feedback 17: the owner's own shell needs no "by"; another value is refused.
+    owner_without_team(&json!({}), false, false, false, false).unwrap();
+    assert!(owner_without_team(&json!({}), false, false, true, false).is_err());
+    assert!(owner_without_team(&json!({"by":"lead"}), false, false, false, false).is_err());
 }
 
 #[test]
@@ -1600,7 +1701,7 @@ fn an_intake_key_adds_one_urgent_phase_and_no_other_operation() {
         // A team with none of the new fields behaves as today.
         let before = stored();
         assert!(before.intakes.is_empty() && before.intakes_seq == 0, "{before:?}");
-        assert!(!before.settings.restart_crashed);
+        assert!(before.settings.restart_crashed);
         assert!(before.members.iter().all(|member| member.restarts.is_empty() && member.crash.is_none() && !member.crash_told));
         let request = "11111111-2222-4333-8444-555555555551";
         let created = run("intake-key", &json!({"request_id":request,"team":"rv","label":"health watch","by":"human"}), false).unwrap();
@@ -1683,7 +1784,9 @@ fn an_intake_task_keeps_only_its_plan_fields_and_one_phase_is_open_per_key() {
         .unwrap();
         let saved = stored();
         let task = saved.task(added["tasks"][0].as_u64().unwrap() as u32).unwrap();
-        assert_eq!((task.title.as_str(), task.description.as_str()), ("Fix", "d"));
+        assert_eq!((task.title.as_str(), task.description.as_str()), ("Fix", "d
+
+Files: a"));
         assert_eq!(task.criteria, vec!["c"]);
         assert_eq!(task.assignee, "dev");
         // The owner's plan fields are not the key's; the pipeline resolves
@@ -1752,19 +1855,21 @@ fn a_stored_team_without_the_new_fields_loads_and_behaves_as_today() {
     }
     let mut legacy: Team = serde_json::from_value(value).unwrap();
     assert!(legacy.intakes.is_empty() && legacy.intakes_seq == 0);
-    assert!(!legacy.settings.restart_crashed);
+    // Owner, 2026-11-05: restart_crashed is on by default, for old teams too.
+    assert!(legacy.settings.restart_crashed);
     assert!(legacy.members.iter().all(|member| member.restarts.is_empty() && member.crash.is_none() && !member.crash_told));
     // The same plan, hand-out and settings work; none of the new fields is
     // written for a team that does not set them.
     let mut events = Vec::new();
-    ops::apply(&mut legacy, "settings", &json!({"settings":{"restart_crashed":true}}), &Actor::Human, &BTreeSet::new(), &mut events).unwrap();
-    assert!(legacy.settings.restart_crashed);
     let refused = ops::apply(&mut legacy, "settings", &json!({"settings":{"restart_crashed":false}}), &Actor::Member("lead".into()), &BTreeSet::new(), &mut events).unwrap_err();
     assert!(refused.to_string().contains("restart_crashed"), "{refused}");
-    legacy.settings.restart_crashed = false;
+    ops::apply(&mut legacy, "settings", &json!({"settings":{"restart_crashed":false}}), &Actor::Human, &BTreeSet::new(), &mut events).unwrap();
+    assert!(!legacy.settings.restart_crashed);
     let written = serde_json::to_value(&legacy).unwrap();
     assert!(written.get("intakes").is_none() && written.get("intakes_seq").is_none(), "{written}");
-    assert!(written["settings"].get("restart_crashed").is_none(), "{written}");
+    // An explicit off is written and survives a reload.
+    assert_eq!(written["settings"]["restart_crashed"], false, "{written}");
+    assert!(!serde_json::from_value::<Team>(written.clone()).unwrap().settings.restart_crashed);
     assert!(written["members"].as_array().unwrap().iter().all(|member| member.get("restarts").is_none()
         && member.get("crash").is_none() && member.get("crash_told").is_none()), "{written}");
 }
@@ -1776,6 +1881,15 @@ fn a_full_test_run_needs_the_teams_policy_or_the_owners_grant() {
     use crate::state::teams::model::{FullTests, FullTestsGrant};
     assert!(super::full_test_run("cargo-test", &json!({})));
     assert!(!super::full_test_run("cargo-test", &json!({"filter":"teams"})));
+    // Task 53: the request hgs test affected prints for a client crate is
+    // narrowed by its filters; without filters (skips or a manifest alone,
+    // or only empty filters) it is still the whole suite.
+    let printed = json!({"filters":["teams::tests::","teams::catalog_edit::"],"skips":["teams::tests::slow"],"manifest":["client/core/Cargo.toml"]});
+    assert!(!super::full_test_run("cargo-test", &printed));
+    assert!(super::full_test_run("cargo-test", &json!({"manifest":["client/core/Cargo.toml"]})));
+    assert!(super::full_test_run("cargo-test", &json!({"skips":["teams::"],"manifest":["client/core/Cargo.toml"]})));
+    assert!(super::full_test_run("cargo-test", &json!({"filters":[],"manifest":["client/core/Cargo.toml"]})));
+    assert!(super::full_test_run("cargo-test", &json!({"filters":[" "]})));
     assert!(!super::full_test_run("qt-test", &json!({"suite":"test_teams"})));
     assert!(super::full_test_run("android-test", &json!({})));
     assert!(!super::full_test_run("cargo-build", &json!({})));
@@ -1815,7 +1929,7 @@ fn a_proposal_allow_could_not_apply_is_refused_when_made() {
         "tasks":[{"id":2,"title":"Follow-up","assignee":"dev","deps":[1]}]});
     let error = ops::apply(&mut team, "propose", &bare, &lead, &BTreeSet::new(), &mut Vec::new()).unwrap_err();
     let error = format!("{error:#}");
-    assert!(error.contains("Allow could not apply") && error.contains("Invalid task"), "{error}");
+    assert!(error.contains("Allow could not apply") && error.contains("A task \"2\" is invalid: field \"deps\""), "{error}");
     assert!(team.proposals.is_empty(), "nothing was proposed");
     // Unknown work is refused too.
     let unknown = json!({"kind":"cancel-tasks","reason":"drop","tasks":[99]});

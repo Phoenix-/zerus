@@ -38,6 +38,27 @@ gains the exact command and, after the answer, who answered.
   selects the deny option; Zerus then sends the text to the member as one
   message: `"Lead: denied <tool>: <text>"`. A deny without text works as
   before. An allow ignores text.
+- A request Zerus cannot answer (its card has `"can_answer": false`, such as
+  Kimi's Edit and Write approvals, which Kimi takes only in its Terminal
+  panel) is kept as the member's `terminal_question`. The lead's inbox names
+  it once (`terminal_question`, with the card's reason and "tell the owner"),
+  and the owner's attention list shows it at once (`permission_terminal`;
+  `hgs team waiting` lists it as `permission_escalated` with action
+  `open_terminal`). It clears when the session stops asking. Owner,
+  2026-11-04: such an approval waited half an hour with an idle lead.
+  A lead's `hgs team answer` that the native side refuses as Terminal-only
+  ("Another Kimi request is waiting. Answer in Terminal.") moves the
+  request the same way at once; nothing was answered, and the error says so.
+- Owner, 2026-11-05: an agent whose process exited while its terminal stays
+  open (`process_state: "exited"`, Agent exited) is a stopped session for the
+  team, never live. `restart_crashed` (on by default from 2026-11-05, for stored teams too) restarts the lead
+  too, and a running team whose lead's session stopped is on the owner's
+  attention list at once (`lead_stopped`, action `resume_lead`).
+- Owner, 2026-11-05: the lead's inbox message lists permissions and questions
+  first (each stops its member) and asks the lead to answer them all before
+  it ends its turn. One the lead was told of and still has not answered after
+  3 minutes is told once more when the lead is free ("STILL UNANSWERED"),
+  marked `remind:<key>` in the told keys while it stays open.
 
 ```json
 {"request_id":"UUID","team":"ID","member":"frontend","question_id":"Q",

@@ -210,7 +210,9 @@ fn prepared_path(path: &OsStr, first: Option<PathBuf>, last: &[PathBuf]) -> Opti
 /// stay in the state directory, and a host crash must not turn the computer back
 /// into a control console.
 pub fn local_sessions() -> bool {
-    crate::host::staging::enabled()
+    // Task #48: Codex's sandbox user cannot see the owner's marker, yet it
+    // runs inside one of this computer's sessions.
+    crate::host::staging::enabled() || super::foreign_sandbox()
 }
 /// Windows reports every exit as a code; crash statuses read as signals (see `exit_info`).
 pub fn code(status: ExitStatus) -> i32 {
@@ -1166,6 +1168,61 @@ pub fn owner_only_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// T-o8dps1: when another account owns the folder (no WRITE_DAC to change it
+/// with), only an administrator can add this user's entry. On the owner's
+/// explicit click this runs `icacls DIR /grant *<this user's SID>:(OI)(CI)F`
+/// through the UAC prompt and waits for it. The SID is this process's own, so
+/// an administrator account that approves the prompt never grants itself.
+/// Nothing takes ownership. The caller checks the rights again as this user.
+pub fn grant_full_control_elevated(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let sid = user_sid_string().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+    // A quoted argument may not end in a backslash: "D:\" would escape the quote.
+    let folder = path.display().to_string();
+    let folder = folder.trim_end_matches('\\');
+    let folder = if folder.ends_with(':') { format!("{folder}\\.") } else { folder.to_owned() };
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let icacls = system.join("System32").join("icacls.exe");
+    let verb: Vec<u16> = "runas".encode_utf16().chain(Some(0)).collect();
+    let file = wide_path(&icacls);
+    let parameters: Vec<u16> = format!("\"{folder}\" /grant *{sid}:(OI)(CI)F").encode_utf16().chain(Some(0)).collect();
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = parameters.as_ptr();
+    info.nShow = SW_HIDE;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let error = io::Error::last_os_error();
+        // ERROR_CANCELLED: the person declined the administrator prompt.
+        return Err(if error.raw_os_error() == Some(1223) {
+            io::Error::other("the administrator prompt was declined; nothing changed")
+        } else {
+            error
+        });
+    }
+    if info.hProcess.is_null() {
+        return Err(io::Error::other("Windows did not start icacls as administrator"));
+    }
+    let waited = unsafe { WaitForSingleObject(info.hProcess, 300_000) };
+    let mut code = 0u32;
+    let read = unsafe { GetExitCodeProcess(info.hProcess, &mut code) };
+    unsafe { CloseHandle(info.hProcess) };
+    if waited != WAIT_OBJECT_0 || read == 0 {
+        return Err(io::Error::other("icacls as administrator did not finish within five minutes"));
+    }
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "icacls as administrator could not change the folder (exit {code}); its rights may exclude administrators: \
+             take ownership in an administrator terminal (takeown /f \"{folder}\") only if that is your folder"
+        )));
+    }
+    Ok(())
+}
+
 /// U34: the one-line fix the owner gets when the sandbox cannot use a folder;
 /// None when this process already has both rights.
 pub fn sandbox_folder_problem(path: &Path) -> io::Result<Option<String>> {
@@ -1174,9 +1231,16 @@ pub fn sandbox_folder_problem(path: &Path) -> io::Result<Option<String>> {
         return Ok(None);
     }
     let sid = user_sid_string().ok_or_else(|| io::Error::other("this user's identity is unavailable"))?;
+    // Without WRITE_DAC another account owns the folder, and only an
+    // administrator can add this user's entry (T-o8dps1).
+    let owner = if missing.contains(&"WRITE_DAC") {
+        "; another account owns it, so run this in an administrator terminal or choose Grant as administrator"
+    } else {
+        ""
+    };
     Ok(Some(format!(
         "the DeepSeek sandbox needs full control of {} (missing {}); fix it for this folder with:\n  \
-         icacls \"{}\" /grant *{}:(OI)(CI)F",
+         icacls \"{}\" /grant *{}:(OI)(CI)F{owner}",
         path.display(),
         missing.join(" and "),
         path.display(),
@@ -1201,6 +1265,44 @@ fn sid_string(sid: &[u8]) -> String {
         })
         .collect();
     format!("S-{revision}-{authority}-{}", subs.join("-"))
+}
+
+/// Task #48: whether `path` belongs to another user account than this
+/// process's user. Codex's Windows sandbox runs an agent's commands as its own
+/// local user (`CodexSandboxOffline`), so the hgs state it reads is another
+/// user's. A folder owned by Administrators or SYSTEM (an elevated process
+/// made it) is no other user's; nor is one whose owner cannot be read.
+pub fn owned_by_another_user(path: &Path) -> bool {
+    let Some(me) = process::current_user() else { return false };
+    let wide = wide_path(path);
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out pointers are locals; the
+    // descriptor is freed by `Descriptor` and `owner` points into it.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != ERROR_SUCCESS || owner.is_null() {
+        return false;
+    }
+    let _descriptor = Descriptor(descriptor);
+    // SAFETY: `owner` is a valid SID inside the live descriptor.
+    unsafe {
+        if IsWellKnownSid(owner, WinLocalSystemSid) != 0 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 {
+            return false;
+        }
+        let length = GetLengthSid(owner) as usize;
+        std::slice::from_raw_parts(owner as *const u8, length) != me
+    }
 }
 
 struct Descriptor(PSECURITY_DESCRIPTOR);
@@ -1595,6 +1697,10 @@ mod process {
     /// `verify_private` for a file this process has open (for reading or writing).
     pub fn verify_private_file(file: &fs::File) -> io::Result<bool> {
         private_entry(file, Private::File)
+    }
+    /// Owner-only existing directory, checked through its pinned handle.
+    pub fn verify_private_directory(file: &fs::File) -> io::Result<bool> {
+        private_entry(file, Private::Directory)
     }
     fn private_entry(file: &fs::File, kind: Private) -> io::Result<bool> {
         let info = file_information(file)?;
@@ -2431,9 +2537,9 @@ mod process {
     /// `prepare_environment`'s job allows that (spec D4); an enclosing job that
     /// forbids breakaway makes it fail.
     pub fn spawn_detached(command: &mut Command) -> io::Result<Child> {
-        command
-            .creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-            .spawn()
+        spawn_unshared(
+            command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW),
+        )
             .map_err(|error| {
                 // WhiteWh fork: name the cause instead of a bare "access denied".
                 let program = Path::new(command.get_program());
@@ -2448,6 +2554,30 @@ mod process {
                     error
                 }
             })
+    }
+
+    /// Task #28 (4): a process meant to outlive this one starts without this
+    /// process's standard handles. Windows hands a child every inheritable
+    /// handle, not only the ones its STARTUPINFO names, and std starts children
+    /// with inheritance on: a detached `hgs run` runner kept the write end of
+    /// the caller's output pipe, so `hgs run --json` printed its answer but the
+    /// caller (PowerShell, Node) read no end of output until the build ended,
+    /// minutes later. This process's own standard handles stop being
+    /// inheritable before the spawn; a later child that inherits one gets a
+    /// duplicate std makes for it, so nothing else changes.
+    pub(crate) fn spawn_unshared(command: &mut Command) -> io::Result<Child> {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle takes a constant and returns a handle this
+            // process owns, null or INVALID_HANDLE_VALUE; only its flag changes.
+            let handle = unsafe { GetStdHandle(id) };
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                // Best effort: a console pseudo-handle refuses, and has nothing to leak.
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+            }
+        }
+        command.spawn()
     }
 
     type Reader = thread::JoinHandle<io::Result<Vec<u8>>>;
@@ -3726,4 +3856,59 @@ mod tests {
         assert!(select_powershell(None, &[], |_| unreachable!()).is_err());
     }
 
+}
+
+/// Task #28 (4): `hgs run --json` printed its answer at once, yet the caller
+/// (PowerShell in a DeepSeek member, the lead's Node shell) waited minutes for
+/// the end of the output: the detached runner held the caller's pipe.
+#[cfg(test)]
+mod detach_tests {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const HELPER: &str = "platform::windows::detach_tests::detached_child_helper";
+
+    /// The helper side: it starts a ~30 s child the way `spawn_detached`
+    /// does (without the breakaway a test job may forbid) and exits at once.
+    #[test]
+    fn detached_child_helper() {
+        if std::env::var_os("HGS_TEST_DETACH_HELPER").is_none() {
+            return;
+        }
+        let mut sleeper = Command::new("ping");
+        sleeper.args(["-n", "30", "127.0.0.1"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let child = super::process::spawn_unshared(&mut sleeper).unwrap();
+        println!("sleeper {}", child.id());
+    }
+
+    #[test]
+    fn a_detached_child_leaves_the_callers_output_pipe() {
+        let started = Instant::now();
+        let mut helper = Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([HELPER, "--exact", "--nocapture", "--test-threads=1"])
+            .env("HGS_TEST_DETACH_HELPER", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = helper.spawn().unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = output.read_to_string(&mut text);
+            let _ = sender.send(text);
+        });
+        // The helper exits within seconds; its output must end with it, not
+        // when the 30 s child it left behind ends.
+        let text = receiver.recv_timeout(Duration::from_secs(20));
+        let _ = child.wait();
+        if let Some(pid) = text.as_deref().ok().and_then(|text| text.split("sleeper ").nth(1)).and_then(|rest| rest.split_whitespace().next()) {
+            let _ = Command::new("taskkill").args(["/PID", pid, "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        let text = text.expect("the caller's output stayed open while the detached child ran");
+        assert!(text.contains("sleeper "), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    }
 }

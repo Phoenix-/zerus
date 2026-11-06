@@ -7,13 +7,16 @@
 //! `docs/superpowers/plans/2026-10-28-tauri-client-phase1.md` (Tasks 3 and 4)
 //! and the "Event stream" section of `docs/reference.md`.
 
+pub mod account_actions;
 pub mod actions;
 pub mod analytics;
 pub mod approvals;
 pub mod attachments;
 pub mod attention;
+pub mod attention_store;
 pub mod batch;
 pub mod cache;
+pub mod child_environment;
 #[cfg(windows)]
 mod conpty;
 pub mod content_search;
@@ -22,6 +25,7 @@ pub mod desktop;
 pub mod details;
 pub mod download_cache;
 pub mod drafts;
+pub mod end_action;
 pub mod external_file;
 pub mod file_download;
 pub mod fleet;
@@ -32,10 +36,14 @@ pub mod legacy;
 pub mod linux_notify;
 pub mod local_messages;
 pub mod machine;
+pub mod machine_connections;
+pub mod macos_notify;
+pub mod maintenance;
 pub mod marks;
 pub mod menubar;
 pub mod migration;
 pub mod mobile;
+pub mod native_notice;
 pub mod operation_recovery;
 pub mod organization;
 pub mod paths;
@@ -45,6 +53,7 @@ pub mod processes;
 mod pty;
 pub mod qt_lock;
 pub mod questions;
+pub mod quit_journal;
 pub mod readmarks;
 pub mod reads;
 pub mod readsync;
@@ -72,16 +81,21 @@ pub mod task_start;
 pub mod task_view;
 pub mod tasks;
 pub mod tasks_write;
+pub mod teams;
 pub mod terminal;
 pub mod terminal_launch;
 pub mod termination_cleanup;
+pub mod text;
 pub mod trayicon;
+pub mod untracked_shell;
 pub mod updates;
+pub mod video_posters;
 pub mod view;
 pub mod views;
 pub mod voice;
 pub mod voice_composer;
 pub mod voice_driver;
+pub mod worktree_overview;
 pub mod worktree_policy;
 pub mod worktree_review;
 pub mod worktrees;
@@ -106,6 +120,7 @@ pub use state::{ActivityState, CatalogState};
 pub use stream::{StreamEvent, StreamHandle, Timing};
 pub use swarm::grouping::{GroupOut, GroupingOut, HeaderOut, SyncView};
 pub use tasks::{TasksState, TasksUpdate};
+pub use teams::{TeamAction, TeamCall, TeamOutcome, TeamsFollow, TeamsPoller, TeamsUpdate};
 pub use view::ViewRow;
 pub use zerus_watch_protocol::SessionRef;
 
@@ -195,6 +210,13 @@ pub enum ActivityUpdate {
     Event { id: String, rev: u64, event: Value },
     /// The session's latest inspection summary, with provider messages merged.
     State { value: Value, rev: u64 },
+    /// Read transport readiness. This never declares native work finished or
+    /// replaces the last known transcript; a new route resets state revisions.
+    Connection {
+        ready: bool,
+        pending: bool,
+        code: String,
+    },
     /// The subscription ended (the session left the catalog or changed run).
     Ended,
 }
@@ -254,6 +276,19 @@ pub enum Change {
         computer: ComputerId,
         update: OrganizationUpdate,
     },
+    /// A Teams view of the computer, keyed as [`teams::model`] says; see [`teams`].
+    Teams {
+        computer: ComputerId,
+        key: String,
+        update: TeamsUpdate,
+    },
+    /// Task 8: the team revisions of the computer's watch stream (its `team`
+    /// topic), or None while it gives none: the Teams poller of the computer
+    /// then polls. It never reaches the webview.
+    TeamHeads {
+        computer: ComputerId,
+        heads: Option<std::sync::Arc<teams::Heads>>,
+    },
 }
 
 impl Change {
@@ -267,7 +302,9 @@ impl Change {
             | Self::Processes { computer, .. }
             | Self::Tasks { computer, .. }
             | Self::Machine { computer, .. }
-            | Self::Organization { computer, .. } => computer,
+            | Self::Organization { computer, .. }
+            | Self::Teams { computer, .. }
+            | Self::TeamHeads { computer, .. } => computer,
         }
     }
 }

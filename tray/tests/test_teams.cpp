@@ -1255,7 +1255,7 @@ void TestTeams::proposalsSwapsLimitsAndHostsRead()
     QCOMPARE(proposalText(team, team.proposals[0]), QStringLiteral("Swap %1 to codex, gpt-5.5").arg(role));
     QCOMPARE(proposalText(team, team.proposals[1]), QStringLiteral("Remove %1").arg(role));
     QCOMPARE(proposalText(team, team.proposals[2]), QStringLiteral("Next goal: Saved cards"));
-    QCOMPARE(proposalText(team, team.proposals[3]), QStringLiteral("Add Designer (claude)"));
+    QCOMPARE(proposalText(team, team.proposals[3]), QStringLiteral("Add Designer (claude, default account)"));
     QCOMPARE(proposalText(team, team.proposals[4]), QStringLiteral("Swap %1 to the session claude/x/spare").arg(role));
     QVERIFY(resetText(0).isEmpty());
     QVERIFY(resetText(4000).startsWith(QStringLiteral("resets ")));
@@ -1365,6 +1365,17 @@ void TestTeams::feedLinesSpeakOfStartsQuestionsAndHolds()
     QCOMPARE(line("released", QJsonObject{{"by", "Lead"}, {"task", 3}}).text, QStringLiteral("Released #3 Held retry"));
     QCOMPARE(line("report_replaced", QJsonObject{{"task", 2}, {"attempt", 1}}).text,
              QStringLiteral("Replaced the captured reply · #2 Address form · attempt 1"));
+    // Task 52: a start waiting for its host (task 22) and a member woken by
+    // its own settled run (task 36) have their own lines.
+    const auto waiting = line("launch_waiting", QJsonObject{{"member", "Backend"}, {"reason", "hgs: DeepSeek host is still starting"}, {"wait", 2}, {"of", 20}});
+    QCOMPARE(waiting.text, QStringLiteral("The host is still starting; starting again (2 of 20)"));
+    QCOMPARE(waiting.by, QStringLiteral("Backend"));
+    QCOMPARE(waiting.tone, Tone::Muted);
+    const auto woken = line("run_settled_woken", QJsonObject{{"member", "Backend"}, {"task", 1}, {"attempt", 2}, {"run", "r1"}, {"delivered", true}});
+    QCOMPARE(woken.text, QStringLiteral("Woke Backend: its run settled · #1 Saved cards API · attempt 2"));
+    const auto refused = line("run_settled_woken", QJsonObject{{"member", "Backend"}, {"task", 1}, {"attempt", 2}, {"delivered", false}});
+    QCOMPARE(refused.text, QStringLiteral("Its run settled, but waking Backend was refused · #1 Saved cards API · attempt 2"));
+    QCOMPARE(refused.tone, Tone::Warn);
 }
 
 void TestTeams::feedLinesSpeakOfRosterChanges()
@@ -1784,6 +1795,9 @@ void TestTeams::subLeadsFormTheMemberTree()
     QCOMPARE(line("handed_out", {{"by", "Lead"}, {"task", 2}, {"to", "Tester"}}).by, QStringLiteral("Lead"));
     QVERIFY(line("reported", {{"by", "Tester"}, {"to", "QA lead"}, {"task", 2}}).text.startsWith(QStringLiteral("Report to QA lead")));
     QVERIFY(line("reported", {{"by", "Tester"}, {"task", 2}}).text.startsWith(QStringLiteral("Report to Lead")));
+    const auto interim = line("interim_report", {{"by", "Tester"}, {"task", 2}, {"attempt", 1}, {"text", "Half the API is in"}});
+    QCOMPARE(interim.by, QStringLiteral("Tester"));
+    QVERIFY2(interim.text.contains(QStringLiteral("Interim report")) && interim.text.contains(QStringLiteral("Half the API is in")), qPrintable(interim.text));
     QCOMPARE(line("accepted", {{"by", "QA lead"}, {"task", 2}}).by, QStringLiteral("QA lead"));
     // Its status: reviewing a report's work, else coordinating its reports.
     Team running = team;

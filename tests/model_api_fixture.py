@@ -152,9 +152,6 @@ def plan(body, project):
         return ("text", '{"outcome":"allow"}')
     if results(body):
         return ("text", DONE)
-    if prompt == CODEX_SUBAGENT and "spawn_agent" in offered:
-        return ("tool", "spawn_agent", {"task_name": "fixture_child", "message": "Reply to the isolated child fixture.",
-                                        "fork_turns": "none"})
     if prompt == CODEX_ESCALATION and project:
         quote = lambda name: "'" + os.path.join(project, name).replace("'", "''") + "'"
         command = (f"New-Item -ItemType File -Path {quote(CODEX_STARTED)} | Out-Null; "
@@ -162,6 +159,9 @@ def plan(body, project):
                    "{ Start-Sleep -Milliseconds 100 }; Write-Output approval-fixture")
         return ("tool", "exec_command", dict(cmd=command, sandbox_permissions="require_escalated",
                     justification="Run the local approval fixture?", yield_time_ms=10000))
+    if prompt == CODEX_SUBAGENT and "spawn_agent" in offered:
+        return ("tool", "spawn_agent", {"task_name": "fixture_child", "message": "Reply to the isolated child fixture.",
+                                        "fork_turns": "none"})
     if prompt == QUESTIONS and "AskUserQuestion" in offered:
         return ("tool", "AskUserQuestion", {"questions": QUESTION_ITEMS})
     if prompt == TALL_QUESTION and "AskUserQuestion" in offered:

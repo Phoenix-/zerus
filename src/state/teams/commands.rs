@@ -298,7 +298,7 @@ fn resolve_actor(
     // A process outside every session acts as the owner; a session env that
     // does not own the calling process could name another one (H7).
     ensure!(env.is_none(), "Zerus could not verify the calling session");
-    ensure!(text(input, "by") == "human", "Run this from the lead's session, or add \"by\":\"human\" to act as yourself");
+    ensure!(says_owner(input), "{}", BY_REFUSAL);
     Ok(Actor::Human)
 }
 
@@ -1096,6 +1096,10 @@ fn summary(team: &Team, include_cancelled: bool) -> Value {
         // U57: the lead's open proposals (at most 50), so the lead's session
         // window shows their cards from the polled list.
         "proposals":open_proposals(team),
+        // Task 52: the parent task of a sub-team, so a client walks the whole
+        // team tree from the list (a tree action's impact); null for a team
+        // with no parent.
+        "parent":team.parent.as_ref().map(|parent| json!({"team":parent.team,"task":parent.task})),
     })
 }
 
@@ -1195,7 +1199,12 @@ fn draft_get_in(store: &mut Store, input: &Value) -> anyhow::Result<Value> {
     }
     let draft = team.draft.clone().unwrap_or_default();
     let validation = super::plan::validate(&team, &BTreeSet::new());
-    Ok(json!({"draft":draft,"revision":draft.revision,"unseen":draft.unseen,"owner_edited":cleared,"preflight":validation}))
+    // Feedback 2026-11-04 (5): the answer carries what the draft holds, so the
+    // lead and the owner can check what was saved.
+    let fields = json!({"name":team.name,"goal":team.goal,"addendum":team.lead_protocol,"settings":team.settings,
+        "members":team.members,"tasks":team.tasks,"phases":team.phases,"plan_mode":team.plan_mode,"plan_mode_offer":team.plan_mode_offer,
+        "plan_mode_reason":team.plan_mode_reason});
+    Ok(json!({"draft":draft,"revision":draft.revision,"unseen":draft.unseen,"owner_edited":cleared,"preflight":validation,"fields":fields}))
 }
 
 /// F5: the owner starts a draft team; the lead session is adopted when given,
@@ -1215,7 +1224,7 @@ fn draft_start(input: &Value) -> anyhow::Result<Value> {
         if lead.get("id").is_none() {
             lead["id"] = json!("lead");
         }
-        let member: Member = serde_json::from_value(lead.clone()).context("Invalid lead")?;
+        let member: Member = super::strict::parse(&lead, &[], "The lead", super::strict::LEAD_EXAMPLE)?;
         let adopted = adopted_session(&Team::default(), &member, &store.active_teams(ACTIVE_TEAMS)?, &live_sessions()?)?;
         lead["session"] = serde_json::to_value(&adopted.session)?;
     }
@@ -1238,13 +1247,121 @@ fn expected_revision(op: &str, input: &Value) -> Option<u64> {
     }
 }
 
+fn rules_changed(before: &Team, after: &Team, op: &str) -> bool {
+    if before.settings.iron_rules != after.settings.iron_rules { return true; }
+    after.members.iter().filter(|m| m.state != MemberState::Removed).any(|member| {
+        let old = before.member(&member.id).filter(|old| old.state != MemberState::Removed);
+        // Ending/replacing a membership removes that scope, not a rule edit.
+        if op == "swap-member" && member.iron_rules.is_empty() { return false; }
+        old.map(|old| old.iron_rules.as_slice()).unwrap_or_default() != member.iron_rules.as_slice()
+    })
+}
+
+fn rules_word(team: &Team, input: &Value, caller: &Actor) -> anyhow::Result<Option<OwnerWord>> {
+    if matches!(caller, Actor::Human) {
+        return Ok(None);
+    }
+    ensure!(
+        caller.is_lead(team),
+        "Only the owner or the lead on the owner's word changes iron rules"
+    );
+    let rule = super::owner_word::WordRule {
+        phrases: &["iron rules", "железн"],
+        verbs: &["change", "set", "add", "remove", "измен", "добав", "удал"],
+        names: vec![team.name.clone()],
+        expect: format!("change the iron rules for {}", team.name),
+        ..Default::default()
+    };
+    let word = super::owner_word::verify_roster(
+        team,
+        input
+            .get("owner_word")
+            .context("Iron rules need the owner's verified word")?,
+        &rule,
+        super::super::now(),
+    )?;
+    // Roster WordRule deliberately treats an operation verb as sufficient
+    // without its generic roster phrase. Iron rules need the specific scope.
+    let statement = word.text.to_lowercase();
+    ensure!(statement.contains("iron rules") || statement.contains("железн"),
+        "The owner's word must explicitly name iron rules");
+    ensure!(
+        team.owner_word_used(word.event).is_none(),
+        "The owner's word was already used"
+    );
+    Ok(Some(word))
+}
+
+/// Project/session writes share the same proven caller and owner-word gate.
+pub(crate) fn authorize_external_rules(input: &Value) -> anyhow::Result<()> {
+    if super::super::owner_request(input, "iron rules").is_ok() {
+        return Ok(());
+    }
+    let id = text(input, "team");
+    ensure!(
+        !id.is_empty(),
+        "An agent changes rules only as a lead on the owner's verified word"
+    );
+    let mut store = Store::open(true)?;
+    let team = store.load(id)?.context("Unknown team")?;
+    let caller = actor(&team, "settings", input)?;
+    ensure!(
+        caller.is_lead(&team),
+        "Only the lead can act on the owner's word"
+    );
+    if text(input, "scope") == "project" {
+        ensure!(
+            team.project_id == text(input, "project") && !team.project_id.is_empty(),
+            "The project is not this team's project"
+        );
+    } else {
+        ensure!(
+            team.members
+                .iter()
+                .any(|member| member
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.name == text(input, "name")
+                        && session.run_id == text(input, "expected_run_id")
+                        && session.conversation_id == text(input, "expected_conversation_id"))),
+            "The exact session is not in this team"
+        );
+    }
+    store.mutate(
+        Some((text(input, "request_id"), input)),
+        id,
+        input["team_revision"].as_u64(),
+        |team, events| {
+            let word = rules_word(team, input, &caller)?
+                .context("The lead needs the owner's verified word")?;
+            team.record_owner_word(word.event, "the iron rules change");
+            events.push(Event::new(
+                "iron_rules_authorized",
+                json!({"event":word.event,"scope":input["scope"]}),
+            ));
+            Ok(json!({"status":"authorized"}))
+        },
+    )?;
+    Ok(())
+}
+
 /// U12/N4: one owner check for every path that can act as the owner. An agent
 /// session carries DSH_SESSION_ID, HGS_SESSION or HGS_RUN_ID and is refused.
 fn owner_caller(input: &Value, record: bool, dsh: bool, env: bool, run: bool) -> anyhow::Result<()> {
     ensure!(!record && !dsh && !env && !run, "An agent session cannot act as the owner");
-    ensure!(text(input, "by") == "human", "Add \"by\":\"human\" to act as yourself");
+    ensure!(says_owner(input), "{}", BY_REFUSAL);
     Ok(())
 }
+
+/// Owner feedback 2026-11-04 (17): a process outside every agent session (the
+/// owner's own shell or script) acts as the owner without saying so; the
+/// session and ancestry checks before this decide that. `"by":"human"` stays
+/// accepted, and any other value is refused.
+fn says_owner(input: &Value) -> bool {
+    matches!(input.get("by").map(|by| by.as_str()), None | Some(Some("" | "human")))
+}
+
+const BY_REFUSAL: &str = "\"by\" is \"human\" or left out: a command run from outside every agent session acts as you, and an agent acts as itself";
 
 /// C2: an operation before any team exists is yours: from a process outside
 /// every session, saying so.
@@ -1258,11 +1375,17 @@ fn owner_without_team(input: &Value, record: bool, dsh: bool, env: bool, run: bo
 /// returned flag is what `catalog::run` takes: false leaves every owner path
 /// refused, true lets that operation check its own contract.
 fn catalog_owner(input: &Value) -> anyhow::Result<bool> {
+    let (dsh, session, run) = caller_identities();
+    let record = caller_record().is_some();
+    // Owner feedback 2026-11-04 (17): without "by" the owner's own shell is
+    // the owner and an agent session reads the catalog as itself.
+    if text(input, "by").is_empty() {
+        return Ok(!record && dsh.is_none() && session.is_none() && run.is_none());
+    }
     if text(input, "by") != "human" {
         return Ok(false);
     }
-    let (dsh, session, run) = caller_identities();
-    owner_caller(input, caller_record().is_some(), dsh.is_some(), session.is_some(), run.is_some())?;
+    owner_caller(input, record, dsh.is_some(), session.is_some(), run.is_some())?;
     Ok(true)
 }
 
@@ -1278,8 +1401,9 @@ fn draft_start_in(store: &mut Store, request: &str, input: &Value, lead: Value) 
     if lead_value.get("id").is_none() {
         lead_value["id"] = json!("lead");
     }
-    let mut lead: super::model::Member = serde_json::from_value(lead_value).context("Invalid lead")?;
+    let mut lead: super::model::Member = super::strict::parse(&lead_value, &[], "The lead", super::strict::LEAD_EXAMPLE)?;
     ensure!(lead.session.is_some() || !lead.agent.is_empty(), "A draft lead needs an agent or an existing session");
+    super::super::iron_rules::validate(&json!(lead.iron_rules))?;
     lead.id = "lead".into();
     // N6/spec 3: the draft's lead starts in the team's folder, never a worktree.
     lead.folder = MemberFolder::Shared;
@@ -1292,6 +1416,15 @@ fn draft_start_in(store: &mut Store, request: &str, input: &Value, lead: Value) 
         id: uuid::Uuid::new_v4().to_string(),
         name: if name.is_empty() { "New team".into() } else { name },
         folder,
+        project: text(input, "project").trim().chars().take(200).collect(),
+        project_id: {
+            let id = text(input, "project_id");
+            ensure!(
+                id.len() <= 200 && !id.chars().any(char::is_control),
+                "Invalid project identity"
+            );
+            id.to_owned()
+        },
         status: TeamStatus::Draft,
         lead: "lead".into(),
         draft: Some(super::model::Draft { revision: 1, ..Default::default() }),
@@ -1403,7 +1536,7 @@ fn proposal_input(team: &str, kind: &str, member: &Value, request: &str) -> anyh
     let id = member.as_str().or_else(|| member["id"].as_str()).unwrap_or_default();
     ensure!(!id.is_empty(), "The swap-member proposal names its member");
     value["member"] = json!(id);
-    for key in ["agent", "model", "effort", "account", "session"] {
+    for key in ["agent", "model", "effort", "account", "session", "prompt"] {
         if let Some(field) = member.get(key).filter(|field| !field.is_null()) {
             value[key] = field.clone();
         }
@@ -1685,11 +1818,25 @@ fn decide_proposal_in(store: &mut Store, input: &Value, caller: &Actor) -> anyho
             })?;
             json!({"status":"switched","plan_mode":mode})
         }
+        // Task #21: a switch card for base_branch, full_tests or max_members
+        // runs the settings change it names, as the owner's own.
+        "switch-setting" if change["op"] == "settings" => owner_card(&team_id, "settings", &change, &operation_request)?,
         "switch-setting" => {
             // #752: the owner's Allow sets the one setting the card names.
             let change = team.proposals[at]["change"].clone();
             let asked = team.proposals[at]["reason"].as_str().unwrap_or_default().to_owned();
             store.mutate(None, &team_id, None, |team, events| super::ops::switch_setting(team, &change, &id, &asked, events))?
+        }
+        // Task #21: an owner-gated operation runs as the owner's own
+        // `hgs team <op>`: the same checks, adoption, budgets and side
+        // effects, under the proposal's request id, so a retried Allow replays
+        // its receipt and never applies the change twice.
+        op if ops::OWNER_OPS.contains(&op) => owner_card(&team_id, op, &change, &operation_request)?,
+        "iron-rules" => {
+            let mut value = change["input"].clone();
+            value["request_id"] = json!(operation_request);
+            value["by"] = json!("human");
+            super::super::iron_rules::run("set", &value)?
         }
         other => bail!("Unknown proposal kind {other}"),
     };
@@ -1699,10 +1846,30 @@ fn decide_proposal_in(store: &mut Store, input: &Value, caller: &Actor) -> anyho
             proposal["decided_at"] = json!(super::super::now());
             proposal["note"] = json!(reason);
         }
-        events.push(Event::new("proposal_decided", json!({"proposal":id,"accept":true,"kind":kind})));
+        // Task #21: the audit names the operation, what the card showed and the
+        // request it ran under, as a typed word's quote did.
+        let mut detail = json!({"proposal":id,"accept":true,"kind":kind});
+        if let Some(op) = change["op"].as_str() {
+            detail["op"] = json!(op);
+            detail["summary"] = change["summary"].clone();
+            detail["request"] = json!(operation_request);
+        }
+        events.push(Event::new("proposal_decided", detail));
         Ok(Value::Null)
     })?;
     Ok(json!({"status":"accepted","proposal":id,"kind":kind,"result":result}))
+}
+
+/// Task #21: an allowed owner-operation card: the operation with the input
+/// the card shows, as the owner's own request with the proposal's request id.
+/// The caller is the owner (decide-proposal proved it), so no word is read.
+fn owner_card(team_id: &str, op: &str, change: &Value, request: &str) -> anyhow::Result<Value> {
+    let mut value = change["input"].clone();
+    ensure!(value.is_object(), "The proposal carries its operation's input");
+    value["team"] = json!(team_id);
+    value["request_id"] = json!(request);
+    value["by"] = json!("human");
+    run(op, &value, false)
 }
 
 /// N8: a sub-team's create input cannot set an owner-only setting.
@@ -1953,7 +2120,7 @@ fn create(input: &Value) -> anyhow::Result<Value> {
         if let Some(record) = caller_record() {
             // A lead creates its own team: its session is the lead's.
             let lead = &mut filled["lead"];
-            ensure!(lead.is_object(), "Describe the lead");
+            ensure!(lead.is_object(), "Describe the lead as \"lead\": {}", super::strict::LEAD_EXAMPLE);
             let session = json!({"name":record["name"],"run_id":record["run_id"],"conversation_id":record["conversation_id"]});
             ensure!(lead["session"].is_null() || lead["session"]["name"] == record["name"], "A session creates only a team it leads");
             lead["session"] = session;
@@ -1968,7 +2135,7 @@ fn create(input: &Value) -> anyhow::Result<Value> {
                 .context("Run this from the lead's session, or add \"by\":\"human\" to act as yourself")?;
         }
     }
-    let (team, events, child_id) = {
+    let (mut team, events, child_id) = {
         let mut child_id = uuid::Uuid::new_v4().to_string();
         if let Some((parent_id, task)) = &parent_link {
             // N25: reserve the parent link before the child exists. The request
@@ -1998,6 +2165,19 @@ fn create(input: &Value) -> anyhow::Result<Value> {
             }
         }
     };
+    let rules_authorization = (|| -> anyhow::Result<()> {
+        if !team.settings.iron_rules.is_empty() || team.members.iter().any(|member| !member.iron_rules.is_empty()) {
+            let caller = actor(&team, "settings", input)?;
+            if let Some(word) = rules_word(&team, input, &caller)? {
+                team.record_owner_word(word.event, "the initial iron rules");
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = rules_authorization {
+        release_reservation(&parent_link, &child_id);
+        return Err(error);
+    }
     // Section 9.2: depth, children and tree sessions are checked at create.
     if let Some((parent_id, _)) = &parent_link {
         let check = (|| -> anyhow::Result<()> {
@@ -2096,7 +2276,33 @@ fn answer(input: &Value) -> anyhow::Result<Value> {
     let request = json!({"request_id":uuid::Uuid::new_v4().to_string(),"expected_run_id":session.run_id,
         "expected_conversation_id":session.conversation_id,"question_id":question,"expected_question_hash":hash,"answers":input["answers"]});
     let output = super::dispatcher::hgs(&session.host, &["answer", &session.name, "--json"], Some(&request), std::time::Duration::from_secs(120))?;
-    ensure!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr).trim());
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        // The owner, 2026-11-05: Kimi refuses an answer from outside its
+        // Terminal while another of its requests waits; the lead then had a
+        // request it could never answer. It goes to the owner at once.
+        if super::dispatcher::terminal_only(&error) {
+            let name = team.name_of(&member_id);
+            let mut store = Store::open(true)?;
+            store.mutate(None, &team.id, None, |team, events| {
+                let role = team.role_of(&member_id);
+                if let Some(found) = team.members.iter_mut().find(|found| found.id == member_id) {
+                    if let Some(mut asked) = found.pending.take_if(|pending| pending.question_id == question) {
+                        asked.card["can_answer"] = json!(false);
+                        asked.card["answer_unavailable_reason"] = json!(error);
+                        if found.permission.as_ref().is_some_and(|pending| pending["question_id"] == question.as_str()) {
+                            found.permission = None;
+                        }
+                        events.push(Event::new("question_in_terminal", json!({"member":role,"question_id":question,"reason":error})));
+                        found.terminal_question = Some(asked);
+                    }
+                }
+                Ok(Value::Null)
+            })?;
+            bail!("{error} Nothing was answered: it now waits for the owner in {name}'s Terminal, and the owner sees it at once.");
+        }
+        bail!("{error}");
+    }
     // B2: a denied permission's text reaches the member as one message, and
     // B1: the lead's or owner's answer is recorded with its reason.
     let selected: Vec<&str> = input["answers"]
@@ -2310,7 +2516,8 @@ pub(crate) fn current_view(team: &Team, member: &str) -> anyhow::Result<Value> {
             "team": team.id,
             "task": task.id,
             "attempt": attempt.id,
-            "text": "..."
+            "text": "...",
+            "interim": false
         }
     }))
 }
@@ -2917,7 +3124,7 @@ fn adopt_members(store: &Store, team: &Team, members: &mut [Value]) -> anyhow::R
         if !value["session"].is_object() {
             continue;
         }
-        let member: Member = serde_json::from_value(value.clone()).context("Invalid member")?;
+        let member: Member = super::strict::parse(value, &[], "A member", super::strict::MEMBER_EXAMPLE)?;
         let adopted = adopted_session(team, &member, &teams, &sessions)?;
         value["session"] = serde_json::to_value(&adopted.session)?;
         value["directory"] = json!(adopted.directory);
@@ -2935,6 +3142,12 @@ fn queues_instead(op: &str) -> bool {
 /// The team's files refuse writes here: SQLite opened them read-only, or the
 /// system denies access (in any language: Windows localizes its message).
 fn read_only(error: &anyhow::Error) -> bool {
+    // Task #48: in a sandbox (Low integrity, or Codex's other user) every
+    // refused write is the sandbox's, whatever the error says (a private
+    // folder check, a localized message): the request waits in the folder.
+    if crate::platform::sandboxed() {
+        return true;
+    }
     let text = format!("{error:#}").to_lowercase();
     ["readonly", "read-only", "access is denied", "permission denied", "os error 5)", "os error 13)", "unable to open database"]
         .iter()
@@ -3006,6 +3219,40 @@ fn queue_write(op: &str, input: &Value, wait: bool) -> anyhow::Result<Value> {
         "status":"queued", "request_id":request_id, "path":path.to_string_lossy(),
         "note":"The team worker has not applied it in 30 s; it stays queued in the member's folder."
     })))
+}
+
+/// Task #28: a sandboxed member's own request to the team worker - `run`
+/// (`hgs run`) or `read` (a host read) - waits in its folder as a report does
+/// (U20). The member is the one whose session `caller` is (a dsh member by
+/// the conversation its harness exports) in a team that runs; the worker
+/// applies the request on its next tick. Returns the folder, where the
+/// worker's outcome appears, and that outcome when the request was answered.
+pub(crate) fn queue_for_sandbox(caller: &Value, op: &str, request_id: &str, input: &Value) -> anyhow::Result<(std::path::PathBuf, Option<Value>)> {
+    ensure!(matches!(op, "session-run" | "read"), "Unknown sandbox request {op}");
+    ensure!(super::store::canonical_uuid(request_id), "A canonical request_id is required");
+    let store = Store::open(false)?;
+    let teams = store.active_teams(ACTIVE_TEAMS)?;
+    let (team, member_id) = teams
+        .iter()
+        .filter(|team| matches!(team.status, TeamStatus::Running | TeamStatus::Paused))
+        .find_map(|team| calling_member(team, caller).filter(|member| *member != team.lead).map(|member| (team, member)))
+        .context("The sandbox blocks this here, and only a member of a running team can ask the team worker to do it")?;
+    let member = team.member(&member_id).context("Unknown member")?;
+    let folder = member_outbox_folder(team, member)?;
+    if let Some(result) = super::outbox::result(&folder, request_id) {
+        return Ok((folder, Some(result)));
+    }
+    let request = json!({"op":op, "request_id":request_id, "team":team.id, "member":member_id, "input":input});
+    match super::outbox::request(&folder, request_id) {
+        Some(queued) => ensure!(
+            queued["op"] == request["op"] && queued["input"] == request["input"],
+            "request_id {request_id} already queues another request; use a new request_id"
+        ),
+        None => {
+            super::outbox::push(&folder, &request)?;
+        }
+    }
+    Ok((folder, None))
 }
 
 /// The teams a finished team's `left_running` looks at: only the ones that
@@ -3162,7 +3409,11 @@ fn roster_word_rule(team: &Team, op: &str, input: &Value) -> super::owner_word::
                     all: Vec::new(),
                     add: false,
                     verbs: SWAP_VERBS,
-                    names: ids.iter().flat_map(|id| names_for(id)).collect(),
+                    names: ids
+                        .iter()
+                        .flat_map(|id| names_for(id))
+                        .chain(super::owner_word::EVERYONE_WORDS.iter().map(|word| (*word).to_owned()))
+                        .collect(),
                     expect: format!("swap {}", ids.join(", ")),
                 }
             }
@@ -3182,7 +3433,7 @@ fn roster_word_rule(team: &Team, op: &str, input: &Value) -> super::owner_word::
                     all: Vec::new(),
                     add: false,
                     verbs: super::owner_word::RELAUNCH_VERBS,
-                    names: names_for(id),
+                    names: names_for(id).into_iter().chain(super::owner_word::EVERYONE_WORDS.iter().map(|word| (*word).to_owned())).collect(),
                     expect: format!("relaunch {id}"),
                 }
             }
@@ -3223,12 +3474,15 @@ fn check_roster_word(
         object.remove("roster_word");
     }
     // The sentence is the request's `owner_word` object, as `approve` takes it.
+    // Task #21: the owner allows a roster change with a click on a card; a
+    // typed word is only a fallback, never asked for.
+    let card = card_hint(op, filled);
     let word_input = input.get("owner_word").filter(|word| word.is_object()).with_context(|| {
-        format!("The lead changes the roster only on your word: pass \"owner_word\" with the owner's sentence, such as \"{}\"", rule.expect)
+        format!("The lead changes the roster only on your word: propose it, {card} | hgs team propose --json, and you allow it with a click (a quoted \"owner_word\" stays a fallback)")
     })?;
-    // U56: the refusal names a sentence that would pass.
+    // U56: the refusal names the card that would pass.
     let word = verify(team, word_input, &rule, super::super::now()).with_context(|| {
-        format!("The lead changes the roster only on your word: quote your own sentence of the last 30 minutes that says \"{}\"; without it, propose the change (F8)", rule.expect)
+        format!("None of your messages of the last 30 minutes is your word for this change; the lead proposes it instead, {card} | hgs team propose --json, and you allow it with a click")
     })?;
     // U32/N7: a count word ("add two backends") authorizes that many adds and
     // the cap grows by one for each; every other word pays for one change.
@@ -3266,7 +3520,15 @@ fn check_roster_word(
         ensure!(said == asked, "The owner's sentence names {said} members, not {asked}; quote a sentence naming the count");
         (1, format!("scaling {role} by {asked}"))
     } else if op == "drain" {
-        (1, "draining the member".to_owned())
+        // Task #21: one message may name several members; it pays once for each.
+        (1, format!("draining {}", text(filled, "member")))
+    } else if matches!(op, "relaunch" | "remove-member") && !super::owner_word::says_everyone(&word.text) {
+        (1, format!("{} {}", if op == "relaunch" { "relaunching" } else { "removing" }, text(filled, "member")))
+    } else if matches!(op, "relaunch" | "swap-member") && super::owner_word::says_everyone(&word.text) {
+        // Feedback 16: "перезапусти их" pays for one relaunch (or swap) of
+        // each member, never more than the team has.
+        let members = team.members.iter().filter(|member| member.state != MemberState::Removed).count();
+        (members.max(1), if op == "relaunch" { "relaunching the members".to_owned() } else { "swapping the members".to_owned() })
     } else {
         (1, "the roster change".to_owned())
     };
@@ -3280,6 +3542,20 @@ fn check_roster_word(
     filled["owner_word_event"] = json!(word.event);
     filled["roster_word"] = Value::Bool(true);
     Ok(())
+}
+
+/// Task #21: the proposal that asks the owner for this roster change.
+fn card_hint(op: &str, input: &Value) -> String {
+    let member = text(input, "member");
+    match op {
+        "relaunch" | "drain" | "remove-member" => format!("{{\"kind\":\"{op}\",\"member\":\"{member}\",\"reason\":\"...\"}}"),
+        "swap-member" => format!("{{\"kind\":\"swap-member\",\"member\":\"{member}\",\"account\":\"...\",\"reason\":\"...\"}}"),
+        "add-member" => "{\"kind\":\"add-member\",\"member\":{...},\"reason\":\"...\"}".to_owned(),
+        "scale" => format!("{{\"kind\":\"scale\",\"role\":\"{}\",\"agent\":\"{}\",\"count\":{},\"reason\":\"...\"}}",
+            text(input, "role"), text(input, "agent"), input["count"].as_u64().unwrap_or(1)),
+        "settings" => "{\"kind\":\"settings\",\"settings\":{\"max_members\":...},\"reason\":\"...\"}".to_owned(),
+        other => format!("{{\"kind\":\"{other}\",\"reason\":\"...\"}}"),
+    }
 }
 
 /// U29: fills the verified owner word of an addition to a running phase for
@@ -3301,7 +3577,7 @@ fn check_phase_word(
     let word = input
         .get("owner_word")
         .filter(|word| word.is_object())
-        .with_context(|| format!("The lead adds a task to a running phase only on your word: pass \"owner_word\" with the owner's sentence, such as \"add a task to phase {phase}\""))?;
+        .with_context(|| format!("The lead adds a task to a running phase only on your word: propose it, {{\"kind\":\"add-to-phase\",\"phase\":{phase},\"tasks\":[...],\"reason\":\"...\"}} | hgs team propose --json, and the owner allows it with a click"))?;
     let (kind, after, change) = match input["confirm"].as_str().filter(|id| !id.is_empty()) {
         None => (super::owner_word::PhaseWord::Request, 0.0, "the request to add to a running phase"),
         Some(id) => {
@@ -3696,8 +3972,14 @@ fn running_note(request_id: &str) -> Value {
 /// filter, binary or package and the Android unit tests run everything.
 fn full_test_run(template: &str, args: &Value) -> bool {
     let empty = |key: &str| text(args, key).is_empty();
+    // Task 53: the run hgs test affected prints for a crate names its tests in
+    // `filters` (with skips and the crate's manifest), not in `filter`: a
+    // non-empty filters list narrows the run. Skips or a manifest alone do not.
+    let filters = args["filters"].as_array().is_some_and(|filters| {
+        filters.iter().any(|filter| filter.as_str().is_some_and(|filter| !filter.trim().is_empty()))
+    });
     match template {
-        "cargo-test" => empty("filter") && empty("bin") && empty("package"),
+        "cargo-test" => empty("filter") && empty("bin") && empty("package") && !filters,
         "android-test" => true,
         _ => false,
     }
@@ -3725,13 +4007,13 @@ fn check_full_run(team: &Team, folder: &std::path::Path) -> anyhow::Result<bool>
     if !granted || policy == FullTests::Never {
         let estimate = full_estimate(folder, team);
         bail!(
-            "This is a full test run ({estimate}). The team's full_tests is {}: ask the owner for one run bound to a release, then set it with {} | hgs team full-tests --json, or the owner sets \"full_tests\":\"allowed\".",
+            "This is a full test run ({estimate}). The team's full_tests is {}: propose one run bound to a release, {} | hgs team propose --json, and the owner allows it with a click (or sets \"full_tests\":\"allowed\").",
             match policy {
                 FullTests::Never => "\"never\"",
                 FullTests::Ask => "\"ask\"",
                 FullTests::Allowed => "\"allowed\"",
             },
-            json!({"request_id":"<new UUID>","team":team.id,"release":"<release>"})
+            json!({"request_id":"<new UUID>","team":team.id,"kind":"full-tests","release":"<release>","reason":"<why>"})
         );
     }
     Ok(true)
@@ -4148,11 +4430,14 @@ fn run(op: &str, input: &Value, wait: bool) -> anyhow::Result<Value> {
                 let caller = if parent_lead { Actor::ParentLead } else { actor(&team, op, &filled)? };
                 let auto_plan = op == "approve" && team.settings.approval == Approval::Auto;
                 if matches!(&caller, Actor::Member(member) if *member == team.lead) && !auto_plan {
-                    // U56: a refusal names the sentence this approval expects.
+                    // U56/task #21: a refusal names the card this approval is.
                     let phase = (op == "approve-phase").then(|| input["phase"].as_u64().and_then(|n| u32::try_from(n).ok())).flatten();
-                    let sentence = super::owner_word::approval_sentence(phase);
+                    let card = match phase {
+                        Some(n) => format!("{{\"kind\":\"approve-phase\",\"phase\":{n},\"reason\":\"...\"}}"),
+                        None => "{\"kind\":\"approve\",\"reason\":\"...\"}".to_owned(),
+                    };
                     let word = input.get("owner_word").filter(|word| word.is_object()).with_context(|| {
-                        format!("The lead approves only on the owner's word: pass \"owner_word\" with the owner's sentence, which says {sentence}")
+                        format!("The lead approves only with the owner's approval: propose it, {card} | hgs team propose --json, and the owner allows it with a click")
                     })?;
                     let verified = super::owner_word::verify(&team, word, phase, super::super::now())?;
                     if let Some(used) = team.owner_word_used(verified.event) {
@@ -4199,7 +4484,15 @@ fn run(op: &str, input: &Value, wait: bool) -> anyhow::Result<Value> {
                 && store.receipt(request, input)?.is_some();
             let mut receipt = match store.mutate(Some((request, input)), team_id, revision, |team, events| {
                 let actor = if parent_lead { Actor::ParentLead } else { actor(team, op, &filled)? };
-                ops::apply(team, op, &filled, &actor, &BTreeSet::new(), events)
+                let before = team.clone();
+                let result = ops::apply(team, op, &filled, &actor, &BTreeSet::new(), events)?;
+                if rules_changed(&before, team, op) {
+                    if let Some(word) = rules_word(&before, input, &actor)? {
+                        team.record_owner_word(word.event, "the team's iron rules");
+                    }
+                    events.push(Event::new("iron_rules_changed", json!({"by":actor.label(team)})));
+                }
+                Ok(result)
             }) {
                 Ok(receipt) => receipt,
                 Err(error) if queues_instead(op) && read_only(&error) => {
@@ -4314,6 +4607,11 @@ pub(crate) fn dispatch(args: &[String]) -> Result<i32> {
     if bytes.len() > 256 * 1024 {
         return Err("Team request exceeds 256 KiB".into());
     }
+    // Feedback 2026-11-04 (8): an empty request says how to send one from
+    // PowerShell, which has no <<<.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(format!("hgs team {operation} reads one JSON object: pipe it in, or save it and pass --json-file PATH"));
+    }
     let input: Value = super::super::json_request(&bytes)?;
     if !input.is_object() {
         return Err("A JSON object is required".into());
@@ -4341,6 +4639,10 @@ mod commands_proposals;
 #[cfg(test)]
 #[path = "tests/commands_owner_word.rs"]
 mod commands_owner_word;
+
+#[cfg(test)]
+#[path = "tests/commands_iron_rules.rs"]
+mod commands_iron_rules;
 
 #[cfg(test)]
 #[path = "tests/commands_runs.rs"]

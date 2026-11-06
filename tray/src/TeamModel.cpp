@@ -216,7 +216,8 @@ QString implementerOf(const Task &task, const StageRun &run)
 int scaleRoom(const Team &team)
 {
     if (team.maxMembers <= 0) return 10;
-    const auto seats = std::count_if(team.members.cbegin(), team.members.cend(), [](const Member &m) { return m.state != QLatin1String("removed"); });
+    // Owner feedback 2026-11-04 (4): the cap counts the members besides the lead.
+    const auto seats = std::count_if(team.members.cbegin(), team.members.cend(), [&team](const Member &m) { return m.state != QLatin1String("removed") && m.id != team.lead; });
     return team.maxMembers - int(seats);
 }
 
@@ -404,7 +405,7 @@ Team parse(const QJsonObject &v)
 {
     Team team;
     team.id = str(v, "id"); team.name = str(v, "name"); team.status = str(v, "status");
-    team.project = str(v, "project"); team.folder = str(v, "folder"); team.lead = str(v, "lead");
+    team.project = str(v, "project"); team.projectId = str(v, "project_id"); team.folder = str(v, "folder"); team.lead = str(v, "lead");
     // G1: the parent task this team came from and its sub-teams.
     if (v.value("parent").isObject()) {
         const auto parent = v.value("parent").toObject();
@@ -442,6 +443,7 @@ Team parse(const QJsonObject &v)
         member.account = str(m, "account"); member.effort = str(m, "effort"); member.permissions = str(m, "permissions");
         member.sessionAccountKnown = m.contains("session_account"); member.sessionAccount = str(m, "session_account");
         member.folder = str(m, "folder"); member.directory = str(m, "directory"); member.prompt = str(m, "prompt");
+        for (const auto &rule : m.value("iron_rules").toArray()) member.ironRules << rule.toString();
         const auto session = m.value("session").toObject();
         member.host = str(session, "host"); member.session = str(session, "name");
         member.runId = str(session, "run_id"); member.conversationId = str(session, "conversation_id");
@@ -1052,6 +1054,7 @@ QJsonObject Member::json() const
 {
     QJsonObject o{{"id", id}, {"role", role}, {"agent", agent}, {"account", account}, {"model", model}, {"effort", effort},
                   {"permissions", permissions}, {"computer", computer}, {"directory", directory}, {"prompt", prompt}};
+    if (!ironRules.isEmpty()) o.insert("iron_rules", QJsonArray::fromStringList(ironRules));
     if (!folder.isEmpty()) o.insert("folder", folder);
     if (!parent.isEmpty()) o.insert("parent", parent);
     if (sub) o.insert("sub", true);
@@ -1329,6 +1332,9 @@ QString proposedMember(const Team &team, const QJsonObject &object, const QStrin
     QStringList how;
     for (const auto *key : {"agent", "model", "effort", "account"})
         if (const auto value = object.value(QLatin1String(key)).toString(); !value.isEmpty()) how << value;
+    // Feedback 2026-11-04 (13): a member without an account runs on its
+    // computer's default one; the card says so instead of showing nothing.
+    if (object.value("account").toString().isEmpty() && !object.contains("session")) how << tr("default account");
     // #724: no dots as separators (the card shows on Waiting for you too).
     return how.isEmpty() ? role : QStringLiteral("%1 (%2)").arg(role, how.join(QStringLiteral(", ")));
 }
@@ -1355,6 +1361,9 @@ QString proposalText(const Team &team, const Team::Proposal &proposal)
     for (const auto *key : {"agent", "model", "effort", "account"})
         if (const auto value = object.value(QLatin1String(key)).toString(); !value.isEmpty()) how << value;
     const auto change = proposal.change.toObject();
+    // Task #21: a card for an owner-gated operation says what hgs wrote for
+    // it (relaunch, scale, drain, approvals, phase changes, settings, rules).
+    if (change.contains(QLatin1String("op")) && !change.value("summary").toString().isEmpty()) return change.value("summary").toString();
     if (proposal.kind == "add-member") {
         const auto members = proposedMembers(proposal);
         if (members.size() > 1) return tr("Add %1 members").arg(members.size());
@@ -1363,9 +1372,11 @@ QString proposalText(const Team &team, const Team::Proposal &proposal)
     }
     if (proposal.kind == "remove-member") return tr("Remove %1").arg(role);
     if (proposal.kind == "swap-member") {
+        // Feedback 2026-11-04 (18): one card may swap several members.
+        if (const auto members = proposedMembers(proposal); members.size() > 1) return tr("Swap %1 members").arg(members.size());
         const auto session = object.value("session").toObject().value("name").toString();
         if (!session.isEmpty()) return tr("Swap %1 to the session %2").arg(role, session);
-        return how.isEmpty() ? tr("Swap %1 to a new session").arg(role) : tr("Swap %1 to %2").arg(role, how.join(QStringLiteral(", ")));
+        return how.isEmpty() ? tr("Swap %1 to a new session with the same settings").arg(role) : tr("Swap %1 to %2").arg(role, how.join(QStringLiteral(", ")));
     }
     if (proposal.kind == "next-goal") return tr("Next goal: %1").arg(proposal.goal.section('\n', 0, 0).left(120));
     if (proposal.kind == "switch-plan-mode") return proposal.mode == "standard" ? tr("Switch to standard planning") : tr("Switch to free planning");
@@ -1396,6 +1407,11 @@ QStringList proposalChanges(const Team &team, const Team::Proposal &proposal)
 {
     QStringList lines;
     const auto change = proposal.change.toObject();
+    // Task #21: the lines hgs wrote for an owner-operation card, as they are.
+    if (change.contains(QLatin1String("op"))) {
+        for (const auto &line : change.value("lines").toArray()) if (!line.toString().isEmpty()) lines << line.toString();
+        return lines;
+    }
     const auto taskLine = [&team](int id) {
         const auto *task = team.task(id);
         return task ? tr("#%1 %2 (%3)").arg(id).arg(task->title, statusLabel(task->status)) : tr("#%1").arg(id);
@@ -1407,7 +1423,18 @@ QStringList proposalChanges(const Team &team, const Team::Proposal &proposal)
     } else if (proposal.kind == "remove-member") {
         lines << tr("Its session keeps running; it gets no more tasks.");
     } else if (proposal.kind == "swap-member") {
-        lines << tr("Its open task goes to the new session with what was done so far; the old session keeps running for you to stop.");
+        if (const auto members = proposedMembers(proposal); members.size() > 1)
+            for (const auto &value : members) {
+                const auto member = value.toObject();
+                const QString id = member.value("id").toString();
+                QStringList how;
+                for (const auto *key : {"agent", "model", "effort", "account"})
+                    if (const auto field = member.value(QLatin1String(key)).toString(); !field.isEmpty()) how << field;
+                if (member.contains("prompt")) how << tr("new prompt");
+                const QString role = team.member(id) ? team.roleOf(id) : id;
+                lines << (how.isEmpty() ? tr("%1: a new session with the same settings").arg(role) : tr("%1: %2").arg(role, how.join(QStringLiteral(", "))));
+            }
+        lines << tr("Each open task goes to the new session with what was done so far; the old session is paused and kept under Saved as <name>-replaced.");
     } else if (proposal.kind == "next-goal") {
         lines << proposal.goal.left(600);
     } else if (proposal.kind == "add-to-phase") {
@@ -2139,6 +2166,12 @@ FeedLine feedLine(const Team &team, const QJsonObject &event)
         const QString to = d.value("to").toString();
         t = tr("Report to %1 · %2%3").arg(to.isEmpty() ? tr("Lead") : to, ref, attempt);
     }
+    else if (k == "interim_report") {
+        const QString text = d.value("text").toString();
+        t = text.isEmpty() ? tr("Interim report · %1%2").arg(ref, attempt)
+                           : tr("Interim report · %1%2: “%3”").arg(ref, attempt, text);
+        line.tone = Tone::Active;
+    }
     else if (k == "report_replaced") t = tr("Replaced the captured reply · %1%2").arg(ref, attempt);
     else if (k == "question_asked") {
         const QString text = d.value("text").toString();
@@ -2196,6 +2229,16 @@ FeedLine feedLine(const Team &team, const QJsonObject &event)
     else if (k == "notice_unconfirmed") { t = tr("Report for %1 may not have reached the Lead").arg(ref); line.tone = Tone::Warn; }
     else if (k == "member_started") t = tr("Session started · %1").arg(d.value("session").toString());
     else if (k == "launch_failed") { t = tr("Session failed to start: %1").arg(d.value("error").toString()); line.tone = Tone::Danger; }
+    // Task 52: a start that waits for its host (task 22), and a member woken
+    // when its own team run settled (task 36).
+    else if (k == "launch_waiting") {
+        t = tr("The host is still starting; starting again (%1 of %2)").arg(d.value("wait").toInt()).arg(d.value("of").toInt());
+        line.tone = Tone::Muted;
+    }
+    else if (k == "run_settled_woken") {
+        if (d.value("delivered").toBool(true)) t = tr("Woke %1: its run settled · %2%3").arg(d.value("member").toString(), ref, attempt);
+        else { t = tr("Its run settled, but waking %1 was refused · %2%3").arg(d.value("member").toString(), ref, attempt); line.tone = Tone::Warn; }
+    }
     else if (k == "relaunch") t = tr("Start %1 again").arg(d.value("member").toString());
     else if (k == "member_paused") t = tr("Paused %1").arg(d.value("member").toString());
     else if (k == "member_resumed") t = tr("Resumed %1").arg(d.value("member").toString());

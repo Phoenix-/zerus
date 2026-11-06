@@ -405,7 +405,9 @@ fn the_owners_word_adds_a_member_by_role_and_raises_a_full_cap() {
     let now = crate::state::now();
     let sentence = "может еще одного дипсик бэкендера добавим?";
     let frontend = "может еще одного фронтендера добавим?";
-    let stale = "еще одного дипсик бэкендера добавим";
+    // Task #21: a quote may be part of a fresh message, so the stale one has
+    // words of its own.
+    let stale = "давай добавим еще дипсик бэкендера";
     let relayed = "[Zerus team · from: Zerus] should we add a backend?";
     owner_word_events(dir.path(), &[
         (now - 60.0, sentence),
@@ -443,13 +445,13 @@ fn the_owners_word_adds_a_member_by_role_and_raises_a_full_cap() {
         assert_eq!(value["status"], "added");
         assert_eq!(value["by"], "Lead on your word");
         let saved = Store::open(false).unwrap().load(&id).unwrap().unwrap();
-        assert_eq!(saved.settings.max_members, 7);
+        assert_eq!(saved.settings.max_members, 6);
         let added = saved.member("backend4").unwrap().added.clone().unwrap();
         assert_eq!(added["by"], "Lead on your word");
         assert_eq!(added["owner_word"], sentence);
         // Status shows how the member joined.
         let status = run("status", &json!({"team":id}), false).unwrap();
-        assert_eq!(status["settings"]["max_members"], 7);
+        assert_eq!(status["settings"]["max_members"], 6);
         let member = status["members"].as_array().unwrap().iter().find(|member| member["id"] == "backend4").cloned().unwrap();
         assert_eq!(member["added"]["by"], "Lead on your word");
         assert_eq!(member["added"]["owner_word"], sentence);
@@ -457,7 +459,7 @@ fn the_owners_word_adds_a_member_by_role_and_raises_a_full_cap() {
         let events = run("events", &json!({"team":id}), false).unwrap();
         let items = events["items"].as_array().unwrap();
         let raised = items.iter().find(|item| item["kind"] == "max_members_raised").unwrap();
-        assert_eq!((raised["detail"]["old"].as_u64(), raised["detail"]["new"].as_u64()), (Some(6), Some(7)));
+        assert_eq!((raised["detail"]["old"].as_u64(), raised["detail"]["new"].as_u64()), (Some(5), Some(6)));
         let joined = items.iter().find(|item| item["kind"] == "member_added").unwrap();
         assert_eq!(
             (joined["detail"]["by"].as_str(), joined["detail"]["owner_word"].as_str()),
@@ -595,6 +597,142 @@ fn a_count_word_authorizes_that_many_adds_and_the_cap_grows_by_one_each() {
     });
 }
 
+/// Owner (2026-11-01): the lead session's journal keeps the name it had when
+/// it began, so a renamed lead ("work-7c91e747" -> "Worker") has its events,
+/// including "plan approved", under the earlier name. The word belongs to the
+/// same conversation, so the approval is found.
+#[test]
+fn the_owners_word_is_found_under_an_earlier_name_of_the_lead_session() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let now = crate::state::now();
+    let name = "dsh/zerus-src/Worker";
+    let earlier = "dsh/zerus-src/work-7c91e747";
+    let conversation = "session-conv-lead";
+    let db = rusqlite::Connection::open(dir.path().join("events.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE events (seq INTEGER PRIMARY KEY, name TEXT, conversation TEXT, payload TEXT);").unwrap();
+    db.execute(
+        "INSERT INTO events(name, conversation, payload) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            earlier,
+            conversation,
+            json!({"type":"UserPromptSubmit","at":now - 60.0,"agent_id":"","detail":"plan approved"}).to_string()
+        ],
+    )
+    .unwrap();
+    crate::state::with_test_state_root(dir.path(), || {
+        let _worker = hold_worker_lock();
+        // The dsh binding of the renamed lead: hgs ls shows "Worker", and its
+        // journal began as "work-7c91e747".
+        let binding = dir.path().join("dsh/bindings").join(format!("{:x}.json", Sha256::digest(name.as_bytes())));
+        std::fs::create_dir_all(binding.parent().unwrap()).unwrap();
+        std::fs::write(
+            &binding,
+            json!({"version":1,"name":name,"backend":"dsh","agent":"dsh",
+                "run_id":"r0","conversation_id":conversation,"journal_name":earlier}).to_string(),
+        )
+        .unwrap();
+        let mut store = Store::open(true).unwrap();
+        let (mut team, _) = ops::create(
+            "t",
+            &json!({"name":"Renamed","lead":{"id":"lead","agent":"dsh",
+                "session":{"name":name,"run_id":"r0","conversation_id":conversation}}}),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        ops::apply(
+            &mut team,
+            "plan",
+            &json!({"members":[{"id":"dev","role":"Backend","agent":"codex"}],
+                "tasks":[{"id":1,"title":"API","assignee":"dev"}]}),
+            &Actor::Human,
+            &BTreeSet::new(),
+            &mut events,
+        )
+        .unwrap();
+        let id = team.id.clone();
+        store.create("11111111-1111-4111-8111-111111111111", &json!({}), team, vec![]).unwrap();
+        // The lead of the renamed session approves on the word under its old name.
+        set_test_caller_identities(Some((Some(conversation.into()), None, None)));
+        let approved = run(
+            "approve",
+            &json!({"request_id":"22222222-2222-4222-8222-222222222222","team":id,"owner_word":{"text":"plan approved"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(approved["status"], "approved", "{approved}");
+        let saved = Store::open(false).unwrap().load(&id).unwrap().unwrap();
+        assert_eq!(saved.owner_word.as_ref().map(|word| word.text.as_str()), Some("plan approved"));
+        set_test_caller_identities(None);
+    });
+}
+
+/// Owner (2026-11-01): the same earlier-name journal applies to a Claude Code
+/// session record (not only a dsh binding): "claude/zerus-src/Worker" was
+/// "claude/zerus-src/work-7c91e747" when its journal began.
+#[test]
+fn the_owners_word_is_found_under_an_earlier_name_of_a_claude_session_record() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let now = crate::state::now();
+    let name = "claude/zerus-src/Worker";
+    let earlier = "claude/zerus-src/work-7c91e747";
+    let conversation = "claude-conv-lead";
+    let db = rusqlite::Connection::open(dir.path().join("events.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE events (seq INTEGER PRIMARY KEY, name TEXT, conversation TEXT, payload TEXT);").unwrap();
+    db.execute(
+        "INSERT INTO events(name, conversation, payload) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            earlier,
+            conversation,
+            json!({"type":"UserPromptSubmit","at":now - 60.0,"agent_id":"","detail":"plan approved"}).to_string()
+        ],
+    )
+    .unwrap();
+    crate::state::with_test_state_root(dir.path(), || {
+        let _worker = hold_worker_lock();
+        // The Claude Code record keeps the journal's first name.
+        let record = dir.path().join(format!("{:x}.json", Sha256::digest(name.as_bytes())));
+        std::fs::write(
+            &record,
+            json!({"version":1,"name":name,"agent":"claude",
+                "conversation_id":conversation,"journal_name":earlier}).to_string(),
+        )
+        .unwrap();
+        let mut store = Store::open(true).unwrap();
+        let (mut team, _) = ops::create(
+            "t",
+            &json!({"name":"Renamed Claude","lead":{"id":"lead","agent":"claude",
+                "session":{"name":name,"conversation_id":conversation}}}),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        ops::apply(
+            &mut team,
+            "plan",
+            &json!({"members":[{"id":"dev","role":"Backend","agent":"codex"}],
+                "tasks":[{"id":1,"title":"API","assignee":"dev"}]}),
+            &Actor::Human,
+            &BTreeSet::new(),
+            &mut events,
+        )
+        .unwrap();
+        let id = team.id.clone();
+        store.create("11111111-1111-4111-8111-111111111111", &json!({}), team, vec![]).unwrap();
+        set_test_caller_identities(Some((Some(conversation.into()), None, None)));
+        let approved = run(
+            "approve",
+            &json!({"request_id":"33333333-3333-4333-8333-333333333333","team":id,"owner_word":{"text":"plan approved"}}),
+            false,
+        )
+        .unwrap();
+        assert_eq!(approved["status"], "approved", "{approved}");
+        let saved = Store::open(false).unwrap().load(&id).unwrap().unwrap();
+        assert_eq!(saved.owner_word.as_ref().map(|word| word.text.as_str()), Some("plan approved"));
+        set_test_caller_identities(None);
+    });
+}
+
 /// #728: the lead relaunches a stuck member on the owner's setting without a
 /// word; the owner has the same route; without the setting the word is still
 /// asked.
@@ -621,4 +759,19 @@ fn the_lead_relaunches_a_stuck_member_with_lead_restarts_stuck() {
         let error = as_lead(|| call("relaunch", json!({"member":"dev"}))).unwrap_err().to_string();
         assert!(error.contains("owner_word"), "{error}");
     });
+}
+
+/// Owner feedback 2026-11-04 (16): "перезапусти их на additional аккаунте"
+/// names every member the lead asked about and pays for one relaunch each.
+#[test]
+fn a_sentence_naming_them_all_relaunches_each_member() {
+    assert!(super::super::owner_word::says_everyone("перезапусти их на additional аккаунте"));
+    assert!(super::super::owner_word::says_everyone("Relaunch them all"));
+    assert!(!super::super::owner_word::says_everyone("перезапусти бэкендера"));
+    let mut team = full_team();
+    for member in &mut team.members {
+        member.error = "start failed".into();
+    }
+    let rule = roster_word_rule(&team, "relaunch", &json!({"member":"m1"}));
+    assert!(rule.names.iter().any(|name| name == "их"), "{:?}", rule.names);
 }

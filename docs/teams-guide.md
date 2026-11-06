@@ -31,6 +31,12 @@ This guide is the English original. It describes teams as they are today. A
 | **Shared folder** | A project too large to copy (a game with big assets), or a non-Git folder. | Members edit the same folder. Builds should use the **build broker**. |
 | **Auto** | You want the lead to decide per member. | The lead chooses a worktree or the shared folder for each member. |
 
+A member's own folder is `worktree`, `clone` or `shared`. The catalog's
+read-only roles (Architect, Reviewer, Security, Researcher) name `read_only`:
+the shared folder without a checkout of their own, accepted in a plan and a
+draft as well. A member or task the plan refuses names the field, for example
+`A member "merger" is invalid: field "folder": unknown variant ...`.
+
 With **Branch per task** on, each task gets its own branch (for example
 `task/{id}`) from the base branch, and a returned task keeps its branch.
 
@@ -149,7 +155,7 @@ result.
 | **Plan modes** | Standard plans a release in phases; free keeps an open phase that takes tasks as they come. |
 | **Auto drafts and start-ahead** | With Auto-accept, a drafted phase stays a draft until its first hand-out; the lead can start it ahead when members are idle. |
 | **Rebalancing** | A free member of the right role takes a ready task; a task for a role goes to a member whose models allow it. |
-| **Stuck and crashed members** | A member that stops without a report, or crashes, is noticed; with `restart_crashed` it is restarted at most three times an hour, then held for the lead. |
+| **Stuck and crashed members** | A member that stops without a report, or crashes, is noticed; a member waiting for your answer or for its Background work is not a stop. With `restart_crashed` it is restarted at most three times an hour, then held for the lead. |
 | **Budgets** | A member may declare a time budget; the lead hears once when it is exceeded. |
 | **Sub-teams** | A task may be delegated to a sub-team with its own lead, members and plan; its summary returns as the parent task's report. |
 | **Model servers** | A computer on the network can serve models through an OpenAI- or Anthropic-compatible API; New session can start an agent on this computer wired to it, never changing your global configuration. |

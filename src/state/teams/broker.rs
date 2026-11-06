@@ -206,6 +206,26 @@ pub(crate) fn sharing(team: &Team, member: &Member) -> Vec<String> {
 
 /// Groups of two or more members (the lead not counted: it plans, it does not
 /// build) that share one folder, for the lead's item.
+/// Owner feedback 2026-11-04 (19): whether the folder builds at all: a
+/// project build file at its root, an Unreal project or the project's own
+/// build_broker table. A folder of pages and scripts never gets the broker offer.
+pub(crate) fn builds(folder: &Path) -> bool {
+    const FILES: &[&str] = &[
+        "Cargo.toml", "CMakeLists.txt", "Makefile", "makefile", "GNUmakefile", "build.gradle", "build.gradle.kts", "pom.xml",
+        "go.mod", "meson.build", "BUILD.bazel", "WORKSPACE", "build.zig", "SConstruct", "package.json", "tsconfig.json",
+    ];
+    const EXTENSIONS: &[&str] = &["sln", "csproj", "vcxproj", "uproject", "xcodeproj"];
+    // The project's own tests.toml names its builds; the default templates
+    // alone say nothing about the folder.
+    let declared = fs::read_to_string(folder.join(".zerus").join("tests.toml")).is_ok_and(|text| text.contains("build_broker"));
+    if unreal_project(folder) || declared || FILES.iter().any(|file| folder.join(file).is_file()) {
+        return true;
+    }
+    std::fs::read_dir(folder).into_iter().flatten().flatten().take(500).any(|entry| {
+        entry.path().extension().and_then(|ext| ext.to_str()).is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+    })
+}
+
 pub(crate) fn shared_folders(team: &Team) -> Vec<(String, Vec<String>)> {
     let mut by_folder: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
     for member in team.members.iter().filter(|member| member.id != team.lead && member.state != super::model::MemberState::Removed) {
@@ -721,6 +741,7 @@ fn run_shared(
     let started = Instant::now();
     let until = started + config.ready_wait.min(timeout);
     let mut pending = unready(shared, team, member);
+    let initial_pending = !pending.is_empty();
     let mut told = false;
     while !pending.is_empty() && Instant::now() < until {
         if !told {
@@ -730,7 +751,10 @@ fn run_shared(
         std::thread::sleep(Duration::from_millis(500));
         pending = unready(shared, team, member);
     }
-    let waited = started.elapsed().as_secs();
+    // "waited" is the time spent waiting for other members, not the time this
+    // thread happened to be descheduled while checking readiness. A build with
+    // no initial wait or a zero ready window reports no wait.
+    let waited = if initial_pending && !config.ready_wait.is_zero() { started.elapsed().as_secs() } else { 0 };
     drop(waiting);
     let building = shared.join(".zerus-team").join("runs").join("broker-building");
     fs::create_dir_all(&building)?;

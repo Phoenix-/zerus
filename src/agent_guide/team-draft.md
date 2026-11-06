@@ -8,11 +8,13 @@ lead when the owner names you.
 Read the draft before every change, so the revision is the current one:
   {"action":"get","team":"ID"} | hgs team draft --json
 The answer carries draft (revision, unseen, owner_edited), revision, unseen and
-preflight - the plan errors the owner would hit on create.
+preflight - the plan errors the owner would hit on create - and fields.
+Set only the fields you change (hgs guide team-input).
 Change the draft (lead or owner), carrying the revision you read:
   {"action":"update","request_id":"UUID","team":"ID","revision":N,
    "set":{"name":"...","goal":"...","addendum":"...","settings":{...},
           "members":[...],"tasks":[...]}} | hgs team draft --json
+Set "phases" ({"n","title","barrier"}) and task "phase" as in a plan.
 A field the owner edited after you last read the draft is refused ("Owner
 changed members"): read the draft again. The owner's update marks the field
 owner_edited and drops it from unseen; your get answers the marks it cleared

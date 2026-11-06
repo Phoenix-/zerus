@@ -595,6 +595,7 @@ fn an_accepted_phase_returns_to_a_draft_until_its_work_starts() {
     // You return the queued phase 2: it stays phase 2 before phase 3 with
     // its task #3, Draft again, with a feed event and nothing renumbered.
     events.clear();
+    team.task_mut(3).unwrap().rework_since = Some(1.0);
     let returned = apply(&mut team, "return-to-draft", &json!({"phase":2}), &Actor::Human, &none, &mut events).unwrap();
     assert_eq!((returned["status"].as_str(), returned["from_phase"].as_u64(), returned["phase"].as_u64()), (Some("phase_returned_to_draft"), Some(2), Some(2)));
     assert_eq!(returned["tasks"], json!([3]));
@@ -602,6 +603,7 @@ fn an_accepted_phase_returns_to_a_draft_until_its_work_starts() {
     let draft = team.phases.iter().find(|phase| phase.state == PhaseState::Draft).unwrap();
     assert_eq!((draft.n, draft.decided_at, draft.decided_by.as_str()), (2, None, ""));
     assert_eq!(team.task(3).unwrap().status, TaskStatus::Draft);
+    assert_eq!(team.task(3).unwrap().rework_since, None);
     assert!(!events.iter().any(|event| event.kind == "phase_renumbered"));
     let event = events.iter().find(|event| event.kind == "phase_returned_to_draft").unwrap();
     assert_eq!((event.payload["by"].as_str(), event.payload["phase"].as_u64(), event.payload["from"].as_str()), (Some("You"), Some(2), Some("queued")));
@@ -819,7 +821,7 @@ fn only_you_decide_a_phase_and_only_while_the_team_runs() {
     let error = apply(&mut team, "approve-phase", &json!({"phase":2}), &Actor::Member("lead".into()), &none, &mut events)
         .unwrap_err()
         .to_string();
-    assert_eq!(error, "The lead approves a phase only on the owner's word: pass \"owner_word\"");
+    assert_eq!(error, "The lead approves a phase only on the owner's word: propose {\"kind\":\"approve-phase\"} as a card (hgs guide team-propose); the owner allows it with a click");
     // A finished team refuses both.
     for op in ["approve-phase", "discard-phase"] {
         let mut stopped = team.clone();
@@ -1472,6 +1474,86 @@ fn a_draft_keeps_the_owners_edit_and_creates_after_the_preflight() {
 }
 
 #[test]
+fn a_drafts_task_phases_survive_create_team() {
+    // Task 23, team 33fbafeb: the lead's draft update named phases 1, 2 and 3
+    // on its tasks; the created team had every task in phase 1, so the
+    // per-phase review and the phase approvals were gone.
+    let (mut team, _) = create("t", &json!({"name":"T","lead":{"id":"lead","agent":"claude"}})).unwrap();
+    team.status = TeamStatus::Draft;
+    team.draft = Some(Draft { revision: 1, ..Default::default() });
+    team.settings.approval = Approval::Review;
+    let mut events = Vec::new();
+    let none = BTreeSet::new();
+    let lead = Actor::Member("lead".into());
+    apply(&mut team, "draft", &json!({"action":"update","revision":1,"set":{"members":[{"id":"dev","role":"Backend","agent":"claude"}]}}), &lead, &none, &mut events).unwrap();
+    let tasks: Vec<Value> = (1..=6u32)
+        .map(|id| {
+            let phase = (id + 1) / 2;
+            let mut task = json!({"id":id,"title":format!("Task {id}"),"assignee":"dev"});
+            if phase > 1 {
+                task["phase"] = json!(phase);
+            }
+            task
+        })
+        .collect();
+    apply(&mut team, "draft", &json!({"action":"update","revision":2,"set":{"tasks":tasks,
+        "phases":[{"n":2,"title":"Polish","barrier":true}]}}), &lead, &none, &mut events).unwrap();
+    // The draft holds the tasks' phases; phase 3, named only by tasks, is kept untitled.
+    assert_eq!(team.tasks.iter().map(|task| task.phase).collect::<Vec<_>>(), [1, 1, 2, 2, 3, 3]);
+    let shape = |team: &Team| team.phases.iter().map(|phase| (phase.n, phase.order, phase.title.clone(), phase.barrier, phase.tasks.clone())).collect::<Vec<_>>();
+    assert_eq!(shape(&team), [(2, 2, "Polish".to_owned(), true, vec![3, 4]), (3, 3, String::new(), false, vec![5, 6])]);
+    let value = apply(&mut team, "draft", &json!({"action":"create"}), &Actor::Human, &none, &mut events).unwrap();
+    assert_eq!(value["status"], "planning");
+    // Create keeps every phase, its order, title, barrier and tasks.
+    assert_eq!(team.tasks.iter().map(|task| task.phase).collect::<Vec<_>>(), [1, 1, 2, 2, 3, 3]);
+    assert_eq!(shape(&team), [(2, 2, "Polish".to_owned(), true, vec![3, 4]), (3, 3, String::new(), false, vec![5, 6])]);
+    assert!(team.phases.iter().all(|phase| phase.state == PhaseState::Draft && phase.approval == Approval::Review));
+    let statuses: Vec<TaskStatus> = team.tasks.iter().map(|task| task.status).collect();
+    assert_eq!(statuses, [TaskStatus::Pending, TaskStatus::Pending, TaskStatus::Draft, TaskStatus::Draft, TaskStatus::Draft, TaskStatus::Draft]);
+    // The phases are approved in order, as a planned team's are.
+    apply(&mut team, "approve", &json!({}), &Actor::Human, &none, &mut events).unwrap();
+    let error = apply(&mut team, "approve-phase", &json!({"phase":3}), &Actor::Human, &none, &mut events).unwrap_err().to_string();
+    assert!(error.contains("after the previous phase is approved"), "{error}");
+    apply(&mut team, "approve-phase", &json!({"phase":2}), &Actor::Human, &none, &mut events).unwrap();
+}
+
+#[test]
+fn a_drafts_phases_are_checked_like_a_plans() {
+    let draft = || {
+        let (mut team, _) = create("t", &json!({"name":"T","lead":{"id":"lead","agent":"claude"}})).unwrap();
+        team.status = TeamStatus::Draft;
+        team.draft = Some(Draft { revision: 1, ..Default::default() });
+        team.members.push(Member { id: "dev".into(), role: "Backend".into(), agent: "claude".into(), ..Default::default() });
+        team
+    };
+    let none = BTreeSet::new();
+    let mut events = Vec::new();
+    let update = |team: &mut Team, set: Value| {
+        let revision = team.draft.as_ref().unwrap().revision;
+        apply(team, "draft", &json!({"action":"update","revision":revision,"set":set}), &Actor::Human, &none, &mut Vec::new())
+    };
+    let mut team = draft();
+    for (set, error) in [
+        (json!({"tasks":[{"id":1,"title":"A","assignee":"dev","phase":0}]}), "A task phase is a number from 1"),
+        (json!({"phases":[{"n":1,"title":"No"}]}), "A planned phase is numbered from 2"),
+        (json!({"phases":[{"n":2},{"n":2}]}), "Phase 2 is used twice"),
+        (json!({"tasks":[{"id":1,"title":"A","assignee":"dev"},{"id":1,"title":"B","assignee":"dev"}]}), "Task #1 is used twice"),
+    ] {
+        let found = update(&mut team, set).unwrap_err().to_string();
+        assert!(found.contains(error), "{found}");
+    }
+    // A listed phase without tasks is refused at create, as in a plan.
+    update(&mut team, json!({"tasks":[{"id":1,"title":"A","assignee":"dev"}],"phases":[{"n":2,"title":"Later"}]})).unwrap();
+    let error = apply(&mut team, "draft", &json!({"action":"create"}), &Actor::Human, &none, &mut events).unwrap_err().to_string();
+    assert!(error.contains("Phase 2 has no tasks"), "{error}");
+    // Setting the phases again (none) and a task moved out of phase 2 drops it.
+    update(&mut team, json!({"phases":[]})).unwrap();
+    assert!(team.phases.is_empty());
+    apply(&mut team, "draft", &json!({"action":"create"}), &Actor::Human, &none, &mut events).unwrap();
+    assert_eq!(team.status, TeamStatus::Planning);
+}
+
+#[test]
 fn a_phase_opens_when_the_previous_is_approved_not_finished() {
     let mut team = running_team();
     let mut events = Vec::new();
@@ -1529,7 +1611,7 @@ fn an_approved_phase_edits_until_its_work_starts() {
     let discarded = apply(&mut team, "discard-phase", &json!({"phase":3}), &Actor::Member("lead".into()), &none, &mut events).unwrap();
     assert_eq!(discarded["status"], "phase_discarded");
     let error = apply(&mut team, "approve-phase", &json!({"phase":3}), &Actor::Member("lead".into()), &none, &mut events).unwrap_err().to_string();
-    assert_eq!(error, "The lead approves a phase only on the owner's word: pass \"owner_word\"");
+    assert_eq!(error, "The lead approves a phase only on the owner's word: propose {\"kind\":\"approve-phase\"} as a card (hgs guide team-propose); the owner allows it with a click");
 }
 
 #[test]

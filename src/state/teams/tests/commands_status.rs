@@ -472,6 +472,7 @@ fn current_names_the_live_attempt_and_its_report_command() {
     assert_eq!((report["team"].as_str(), report["task"].as_u64()), (Some("t"), Some(1)));
     assert_eq!(report["attempt"], "00000000-0000-4000-8000-000000000001");
     assert_eq!(report["text"], "...");
+    assert_eq!(report["interim"], false);
     assert!(canonical_uuid(report["request_id"].as_str().unwrap()));
     // Every call offers a fresh request id.
     assert_ne!(current_view(&team, "dev").unwrap()["report"]["request_id"], report["request_id"]);
@@ -938,6 +939,10 @@ fn a_parent_task_shows_its_subteam_and_the_team_lists_its_children() {
     assert_eq!(view["children"], json!([{"team":"child","name":"Child","status":"running","done":1,"total":2}]));
     // The parent's plan health counts only its own tasks.
     assert_eq!(view["health"]["tasks"], 1);
+    // Task 52: the list names each team's parent task, so a client walks the
+    // tree from the list; a team with no parent says null.
+    assert_eq!(summary(&child, true)["parent"], json!({"team":parent.id,"task":1}));
+    assert_eq!(summary(&parent, true)["parent"], json!(null));
 }
 
 #[test]

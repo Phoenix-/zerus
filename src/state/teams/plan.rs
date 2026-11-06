@@ -937,13 +937,36 @@ pub(crate) fn validate(team: &Team, offline: &BTreeSet<String>) -> Validation {
             ));
         }
     }
-    let count = team.members.iter().filter(|member| member.state != MemberState::Removed).count();
-    if count > team.settings.max_members {
+    // Owner feedback 2026-11-04 (13): a member with no account runs on its
+    // computer's default account for its agent; the preflight names them, so
+    // the plan, the draft and the approval show it before anything starts.
+    let defaults: Vec<String> = team
+        .members
+        .iter()
+        .filter(|member| member.state != MemberState::Removed && member.account.trim().is_empty() && member.session.is_none())
+        .map(|member| format!("{} ({})", team.name_of(&member.id), member.agent))
+        .collect();
+    if !defaults.is_empty() {
         found.warnings.push(finding(
+            "account",
+            None,
+            None,
+            format!(
+                "{} start on their computer's default account; set \"account\" to choose another: {}",
+                if defaults.len() == 1 { "1 member".to_owned() } else { format!("{} members", defaults.len()) },
+                defaults.join(", ")
+            ),
+        ));
+    }
+    // Owner, 2026-11-05 (task #18): a limit the create refuses is an error of
+    // the preflight, never a warning beside "Preflight: ok".
+    let count = team.capped_members();
+    if count > team.settings.max_members {
+        found.errors.push(finding(
             "members",
             None,
             None,
-            format!("{count} members — over the team limit of {}", team.settings.max_members),
+            format!("{count} members besides the lead — over the team limit of {} (the lead is not counted)", team.settings.max_members),
         ));
     }
     // B3/B6 preflight: a member's folder against the folder policy and the
@@ -1361,13 +1384,16 @@ mod tests {
         let mut t = team(vec![task(1, &[(9, Hard)], Pending), task(2, &[(3, Hard)], Pending), task(3, &[(2, Hard)], Pending)]);
         t.tasks[0].assignee = "nobody".into();
         t.members[1].computer = "msi-old".into();
-        t.settings.max_members = 1;
+        // The lead is not counted: one member besides it is over a cap of 0.
+        t.settings.max_members = 0;
         let found = validate(&t, &BTreeSet::from(["msi-old".to_owned()]));
         let kinds: Vec<&str> = found.errors.iter().map(|f| f.kind).collect();
-        assert_eq!(kinds, vec!["assignee", "dependency", "cycle"]);
+        // Task #18: over the member limit is an error, as the create refuses it.
+        assert_eq!(kinds, vec!["assignee", "dependency", "cycle", "members"]);
         assert_eq!(found.errors[2].tasks, vec![2, 3]);
         let warnings: Vec<&str> = found.warnings.iter().map(|f| f.kind).collect();
-        assert_eq!(warnings, vec!["offline", "members"]);
+        // Feedback 13: members without an account are named too.
+        assert_eq!(warnings, vec!["offline", "account"]);
         // Cancelled tasks need no assignee.
         t.tasks[0].status = Cancelled;
         assert!(validate(&t, &BTreeSet::new()).errors.iter().all(|f| f.task != Some(1)));

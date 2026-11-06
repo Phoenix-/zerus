@@ -96,6 +96,8 @@ pub(crate) struct FullTestsGrant {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub(crate) struct Settings {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iron_rules: Vec<String>,
     /// Every dependency is hard, whatever the lead chose.
     #[serde(default)]
     pub all_hard: bool,
@@ -179,8 +181,10 @@ pub(crate) struct Settings {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_branch: String,
     /// U52: a member session that exits on its own is launched again into its
-    /// conversation, at most three times an hour; off by default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// conversation, at most three times an hour. On by default (owner,
+    /// 2026-11-05), also for a team stored before, and always written so the
+    /// desktop reads an explicit off.
+    #[serde(default = "default_restart_crashed")]
     pub restart_crashed: bool,
     /// U56: minutes a busy member may go without a session event before Zerus
     /// marks it stuck; 0 (unset) reads the default of 10.
@@ -189,6 +193,11 @@ pub(crate) struct Settings {
     /// U56: the lead may interrupt or relaunch a stuck member; the owner sets it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lead_restarts_stuck: bool,
+    /// Task 24: a member still working on an attempt that a reassign, a
+    /// take-over or a cancel revoked has its turn interrupted once, before its
+    /// stop notice; off by default, only the owner sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt_revoked: bool,
     /// U63 (owner, 2026-10-31): the lead removes its own phase pause by
     /// itself; off by default, when it needs the owner's word.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -224,6 +233,10 @@ fn full_tests_ask(value: &FullTests) -> bool {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub(crate) struct BranchPerTask {
     pub template: String,
+}
+
+fn default_restart_crashed() -> bool {
+    true
 }
 
 fn default_max_members() -> usize {
@@ -279,6 +292,7 @@ fn default_phase() -> u32 {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            iron_rules: Vec::new(),
             all_hard: false,
             folder_policy: FolderPolicy::default(),
             approval: Approval::default(),
@@ -303,9 +317,10 @@ impl Default for Settings {
             land_allowed: false,
             branch_per_task: None,
             base_branch: String::new(),
-            restart_crashed: false,
+            restart_crashed: true,
             stuck_minutes: 0,
             lead_restarts_stuck: false,
+            interrupt_revoked: false,
             lead_removes_own_pause: false,
             phase_acceptance: PhaseAcceptance::Lead,
             build_broker: false,
@@ -347,7 +362,11 @@ pub(crate) enum MemberFolder {
     /// A full clone with its own `.git`, so commit, merge and fetch work
     /// inside a sandboxed member's folder (B4/B6).
     Clone,
+    /// Task #26: the catalog's `read_only` folder (Architect, Reviewer,
+    /// Security, Researcher) is the shared folder with no own checkout, as
+    /// the desktop already reads it; a draft or plan member may name it.
     #[default]
+    #[serde(alias = "read_only")]
     Shared,
 }
 
@@ -371,6 +390,8 @@ pub(crate) struct PromptSnapshot {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub(crate) struct Member {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iron_rules: Vec<String>,
     /// Stable within the team, such as `backend`.
     pub id: String,
     #[serde(default)]
@@ -435,6 +456,12 @@ pub(crate) struct Member {
     /// until you relaunch it.
     #[serde(default)]
     pub error: String,
+    /// Task 22: starts that failed only because the DeepSeek host was still
+    /// starting. The dispatcher starts the member again by itself, at most
+    /// `HOST_WAITS` times, before it records the error; a start or a
+    /// relaunch clears it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub host_waits: u32,
     /// The role's instructions from the catalog, given with every task.
     #[serde(default)]
     pub prompt: String,
@@ -455,6 +482,12 @@ pub(crate) struct Member {
     /// answer (C2): the member's session question as Zerus read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingQuestion>,
+    /// A request of the member's session that Zerus cannot answer (Kimi takes
+    /// its Edit and Write approvals only in its Terminal panel): neither the
+    /// lead nor a safe action can, so the lead hears of it once and the owner
+    /// sees it at once, with where to answer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_question: Option<PendingQuestion>,
     /// The first tick that saw this member idle without a ready task while
     /// tasks were open (C7); cleared when it gets work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -532,6 +565,11 @@ pub(crate) struct Member {
     /// H6: a swapped member's new session starts even before its next task.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub launch_after_swap: bool,
+    /// Owner feedback 2026-11-04 (14): the session a swap replaced, which the
+    /// dispatcher pauses and renames before the new session takes the same
+    /// name; None once it is set aside or gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<SessionRef>,
     /// Spec 5.6 (U25): the member it reports to - the lead (empty) or a
     /// sub-lead of the same team.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -713,6 +751,32 @@ pub(crate) struct TestAlert {
     pub dismissed: bool,
 }
 
+/// A queue wait is independent of its human-readable diagnostic.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MergeWaitReason {
+    Busy,
+    Runners,
+    Selection,
+    Rollback,
+    Ancestry,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl MergeWaitReason {
+    fn is_other(&self) -> bool { *self == Self::Other }
+}
+
+/// One task's untested merged range, never a synthetic test suite.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct MergeRange {
+    pub task: u32,
+    pub prev: String,
+    pub merged: String,
+}
+
 /// U62 (#760): an accepted report in the merge queue: the commit its author
 /// reported, and, while its tests run, the lead branch before and after.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -738,9 +802,34 @@ pub(crate) struct MergeEntry {
     /// The test queue's requests of its affected set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<String>,
+    /// Suites whose declared platforms exclude this computer, with no test
+    /// runner of their class: the merge decides on the suites that ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_run: Vec<String>,
     /// Why it waits (the lead's folder has uncommitted changes).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    #[serde(default, skip_serializing_if = "MergeWaitReason::is_other")]
+    pub wait_reason: MergeWaitReason,
+    /// Open ranges included in these requests, closed only after they pass.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tested_ranges: Vec<MergeRange>,
+    /// Original starts of not-run suites selected by an older open range.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub not_run_since: std::collections::BTreeMap<String, String>,
+    /// A queued retry's lead-branch HEAD and tests-map fingerprint when the
+    /// merge failed: a later tick retries only when one changed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wait_head: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wait_map: String,
+    /// The lead's accept or retry asked to resume this queued retry even when
+    /// neither fingerprint changed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
+    /// Consecutive test-selection failures; the second returns the task.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub selection_failed: u32,
 }
 
 /// U62 (#760): one merge the queue kept, with the range it tested.
@@ -752,6 +841,20 @@ pub(crate) struct MergeLog {
     pub at: f64,
     #[serde(default)]
     pub suites: Vec<String>,
+    /// Suites of another platform that had no runner here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_run: Vec<String>,
+}
+
+/// U62 (#760): a suite whose range is still open because this computer cannot
+/// run it. It stays persisted while the bounded merge log may no longer name it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct OpenNotRun {
+    /// The commit its open range starts at (the branch before its first
+    /// not-run merge).
+    pub since: String,
+    /// The merge queue's not-run message, naming the suite and its platforms.
+    pub message: String,
 }
 
 /// #718: a flaky suite's quarantine, shown to the lead and the owner until
@@ -1313,6 +1416,16 @@ pub(crate) struct Attempt {
     /// The member's turn ended long enough ago without a report.
     #[serde(default)]
     pub no_report: bool,
+    /// Task 36 (audit P8): the Zerus build the member's session was seen
+    /// Building on for this attempt (a claimed `hgs team run`, or `hgs run`):
+    /// its request id, or "build" when the listing names none. While it is
+    /// set and the build has settled, the finished turn is not captured: the
+    /// member is woken once to read the result and go on.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub awaited_run: String,
+    /// What that build runs, for the wake message.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub awaited_label: String,
     /// The newest session event the dispatcher read for this attempt when the
     /// listing's `last_event_at` did not advance (a DeepSeek session's native
     /// tool events, #628). It keeps the silent check from reading the session
@@ -1332,6 +1445,10 @@ pub(crate) struct Attempt {
     pub check: Option<CheckResult>,
     #[serde(default)]
     pub report: Option<Report>,
+    /// An interim report on this open attempt (progress or a question, not a
+    /// delivery): the task stays In progress and nothing enters review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interim: Option<Report>,
     /// Questions this attempt asked the lead, oldest first (A3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<Question>,
@@ -1380,6 +1497,10 @@ pub(crate) struct Task {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// Repo-relative file or directory paths. Empty on older tasks: rebalance
+    /// keeps them with a member that already has work in progress.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<String>,
     /// A plan task, or a check that runs a command (C5).
     #[serde(default, skip_serializing_if = "TaskKind::is_task")]
     pub kind: TaskKind,
@@ -1396,6 +1517,14 @@ pub(crate) struct Task {
     /// another member with the same role.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pinned: bool,
+    /// A non-final rejection reserves this task's member until it is decided
+    /// or explicitly reassigned. Missing on tasks saved before rework existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rework_since: Option<f64>,
+    /// Only an explicit fresh rejection may bypass shared Output on its next
+    /// attempt. Automatic send/preparation refusals never grant this policy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh_retry: bool,
     /// Owner 2026-10-31: the lead's time estimate in minutes. Absent until the
     /// lead sets one; a task without one shows Zerus' own estimate from the
     /// per-computer history.
@@ -1415,6 +1544,12 @@ pub(crate) struct Task {
     /// its affected tests on the merged commit; the task stays undecided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeEntry>,
+    /// At most one open range per task; repeated returns widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untested_merge: Option<MergeRange>,
+    /// A phase build's exact named ranges, bounded to one batch of 500 tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_merge_ranges: Vec<MergeRange>,
     #[serde(default)]
     pub status: TaskStatus,
     /// Held back from the dispatcher until the lead releases it (A5).
@@ -1470,6 +1605,30 @@ pub(crate) struct Task {
     /// they move to the attempt that hands it out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepare: Vec<PrepareStep>,
+}
+
+/// One tick's index of each member's in-progress tasks, built once rather
+/// than scanning the full task list for every candidate member.
+pub(crate) struct InProgressOutputs<'a> {
+    members: std::collections::BTreeMap<&'a str, Vec<&'a Task>>,
+}
+
+impl<'a> InProgressOutputs<'a> {
+    pub(crate) fn new(team: &'a Team) -> Self {
+        let mut members = std::collections::BTreeMap::<&str, Vec<&Task>>::new();
+        for task in &team.tasks {
+            if !task.assignee.is_empty() && matches!(task.status, TaskStatus::Assigned | TaskStatus::InProgress) {
+                members.entry(&task.assignee).or_default().push(task);
+            }
+        }
+        Self { members }
+    }
+
+    pub(crate) fn blocks(&self, task: &Task) -> bool {
+        self.members.get(task.assignee.as_str()).is_some_and(|active| active.iter().any(|other| {
+            other.id != task.id && (task.output.is_empty() || task.output_overlaps(other))
+        }))
+    }
 }
 
 /// U36: one stage of a task's pipeline snapshot.
@@ -1723,6 +1882,28 @@ pub(crate) struct Lane {
 }
 
 impl Task {
+    pub(crate) fn requests_fresh_retry(&self) -> bool {
+        self.fresh_retry && self.failed_by(&self.assignee)
+    }
+    pub(crate) fn failed_by(&self, member: &str) -> bool {
+        self.attempts.iter().any(|attempt| attempt.member == member
+            && matches!(attempt.state, AttemptState::Rejected | AttemptState::Refused)
+            && !super::pipeline::pipeline_returned(attempt))
+    }
+    /// Paths are normalized at task creation/editing; directory containment
+    /// compares components so `src/api` never contains `src/apis`.
+    pub(crate) fn output_overlaps(&self, other: &Task) -> bool {
+        self.output.iter().any(|a| other.output.iter().any(|b| {
+            let a: Vec<_> = a.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+            let b: Vec<_> = b.split('/').filter(|part| !part.is_empty() && *part != ".").collect();
+            a.starts_with(&b) || b.starts_with(&a)
+        }))
+    }
+
+    pub(crate) fn rework(&self) -> bool {
+        self.rework_since.is_some() && !self.status.finished() && !self.assignee.is_empty()
+    }
+
     pub(crate) fn open_attempt(&self) -> Option<&Attempt> {
         self.attempts.iter().rev().find(|attempt| attempt.state.open())
     }
@@ -1911,6 +2092,13 @@ pub(crate) struct Team {
     pub goal: String,
     #[serde(default)]
     pub project: String,
+    /// Stable logical identity; the existing project field remains its label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub iron_rules_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iron_rules_error_at: Option<f64>,
     #[serde(default)]
     pub folder: String,
     #[serde(default)]
@@ -1950,6 +2138,15 @@ pub(crate) struct Team {
     /// queue tested; a phase integration checks only what came after it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub merge_tested: String,
+    /// U62 (#760): the newest merged commit each suite ran on. A suite this
+    /// computer cannot run keeps its own range open without holding the tested
+    /// point of the suites that did run. Bounded.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub merge_tested_suites: std::collections::BTreeMap<String, String>,
+    /// U62 (#760): suites whose ranges are still open because no runner here
+    /// could run them; kept separate from the bounded merge log.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub merge_not_run: std::collections::BTreeMap<String, OpenNotRun>,
     /// U62 (#760): the merges the queue kept, newest last (bounded).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_log: Vec<MergeLog>,
@@ -2064,7 +2261,9 @@ pub(crate) struct Team {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_additions: Vec<PendingAddition>,
     /// #511 N3: members to tell that their worked-ahead attempt was revoked
-    /// with its phase, newest last, at most 20.
+    /// with its phase, newest last, at most 20. Task 24: also a member whose
+    /// attempt in progress was revoked by a reassign, a take-over or a cancel
+    /// (phase 0).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stops: Vec<StopNotice>,
     /// U51: the owner's intake keys; the key itself is never stored, only its
@@ -2100,6 +2299,13 @@ pub(crate) struct StopNotice {
     /// Refused sends so far; after ten it is left unconfirmed for the lead.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub refused: u32,
+    /// Task 24: the owner's interrupt_revoked held when the attempt was
+    /// revoked: a busy session is interrupted once before the notice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
+    /// Task 24: that interrupt was asked for; it is never repeated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 impl Team {
@@ -2113,6 +2319,7 @@ impl Team {
 
     /// U32/N7: how many times that word has paid for a change so far (a stored
     /// word without the count paid once).
+    #[cfg(test)]
     pub(crate) fn owner_word_uses(&self, event: i64) -> usize {
         self.used_owner_words
             .iter()
@@ -2125,10 +2332,17 @@ impl Team {
     /// a count word ("add two backends") authorizes that many adds, every other
     /// word one change.
     pub(crate) fn owner_word_allowed_again(&self, event: i64, allowed: usize, change: &str) -> bool {
-        match self.owner_word_used(event) {
-            None => true,
-            Some(used) => used == change && self.owner_word_uses(event) < allowed.max(1),
+        let spent: Vec<&serde_json::Value> = self.used_owner_words.iter().filter(|used| used["event"].as_i64() == Some(event)).collect();
+        if spent.is_empty() {
+            return true;
         }
+        if let Some(same) = spent.iter().find(|used| used["change"].as_str() == Some(change)) {
+            return (same["uses"].as_u64().unwrap_or(1) as usize) < allowed.max(1);
+        }
+        // Task #21 (owner, 2026-11-05): "relaunch hgs, relaunch ui2" pays once
+        // for each member it names (the name check ran on the whole message);
+        // a word never pays for a change of another kind.
+        member_change(change) && spent.iter().all(|used| used["change"].as_str().is_some_and(member_change))
     }
 
     /// U58: one sentence naming a member and its tasks pays for both changes,
@@ -2143,13 +2357,24 @@ impl Team {
     }
 
     pub(crate) fn record_owner_word(&mut self, event: i64, change: &str) {
-        if let Some(used) = self.used_owner_words.iter_mut().find(|used| used["event"].as_i64() == Some(event)) {
+        // Task #21: a word that paid for several members keeps one record each.
+        let per_member = member_change(change);
+        if let Some(used) = self
+            .used_owner_words
+            .iter_mut()
+            .find(|used| used["event"].as_i64() == Some(event) && (!per_member || used["change"].as_str() == Some(change)))
+        {
             used["uses"] = serde_json::json!(used["uses"].as_u64().unwrap_or(1) + 1);
         } else {
             self.used_owner_words.push(serde_json::json!({"event":event,"change":change,"uses":1}));
             let excess = self.used_owner_words.len().saturating_sub(50);
             self.used_owner_words.drain(..excess);
         }
+    }
+    /// Owner feedback 2026-11-04 (4): `max_members` counts the members
+    /// besides the lead, so "six members" means six beside their lead.
+    pub(crate) fn capped_members(&self) -> usize {
+        self.members.iter().filter(|member| member.state != MemberState::Removed && member.id != self.lead).count()
     }
     pub(crate) fn member(&self, id: &str) -> Option<&Member> {
         self.members.iter().find(|member| member.id == id)
@@ -2182,10 +2407,27 @@ impl Team {
         format!("{member} ({role})")
     }
 
-    /// U56: a task Zerus never gives to another member of its role: pinned by
-    /// the lead or you, or any planned assignee under `keep_assignees`.
+    /// An explicit assignment policy, independent of other tasks' Output.
+    pub(crate) fn requires_assignee(&self, task: &Task) -> bool {
+        task.rework() || task.pinned || (self.settings.keep_assignees && task.role.is_empty() && !task.assignee.is_empty())
+    }
+
+    /// Assignment policy only. Output protection applies separately to
+    /// busy-assignee rebalance, never to choosing a fresh retry member.
     pub(crate) fn keeps_assignee(&self, task: &Task) -> bool {
-        task.pinned || (self.settings.keep_assignees && task.role.is_empty() && !task.assignee.is_empty())
+        self.requires_assignee(task)
+    }
+
+    /// Recheck at the mutation boundary. Tick selection uses one shared index.
+    pub(crate) fn rebalance_blocked(&self, task: &Task) -> bool {
+        self.requires_assignee(task) || (!task.requests_fresh_retry() && InProgressOutputs::new(self).blocks(task))
+    }
+
+    /// A returned task reserves its member even while held or awaiting review.
+    pub(crate) fn reserved_for_rework(&self, member: &str, task: Option<u32>) -> bool {
+        self.tasks.iter().filter(|found| found.rework() && found.assignee == member)
+            .min_by(|a, b| a.rework_since.unwrap().total_cmp(&b.rework_since.unwrap()).then(a.id.cmp(&b.id)))
+            .is_some_and(|found| Some(found.id) != task)
     }
 
     /// Spec 5.6: who reviews a member's work - its parent when that is a
@@ -2237,6 +2479,12 @@ impl Team {
 /// An estimate source of "none" is the default and is not stored.
 fn no_estimate_source(source: &str) -> bool {
     source.is_empty() || source == "none"
+}
+
+/// Task #21: a roster change about one named member ("relaunching hgs"); one
+/// owner message naming several members pays once for each of them.
+fn member_change(change: &str) -> bool {
+    ["relaunching ", "removing ", "draining "].iter().any(|prefix| change.strip_prefix(prefix).is_some_and(|rest| !rest.is_empty() && rest != "the members"))
 }
 
 #[cfg(test)]
@@ -2536,4 +2784,3 @@ mod tests {
         assert!(!attempt.questions[0].open());
     }
 }
-

@@ -1,6 +1,7 @@
+import { desktopService } from "./desktopService";
 import { batch, createEffect, createRoot, createSignal, on, untrack } from "solid-js";
-import { activityPort, composerTab, processesFollow, processesShown, windowVisibility } from "../bridge";
-import { applyBatch, catalog, computerFresh, computerOffline, onReplaced, orderedRows, setDraftKeys } from "./catalog";
+import { activityPort, composerTab, inspectSubagentActivity, processesFollow, processesShown, windowVisibility } from "../bridge";
+import { applyBatch, catalog, computerFresh, computerOffline, onReplaced, orderedRows, rowId, setDraftKeys } from "./catalog";
 import { composer } from "./composer";
 import { sessionModels, bindModelNotice } from "./sessionModels";
 import { bindForkSession } from "./sessionForks";
@@ -9,11 +10,13 @@ import { terminal } from "./terminal";
 import { flag, num } from "./settings";
 import { bindActivity, bindSelection, followedFor, notify, updating } from "./actions";
 import { observeMarks } from "./marks";
-import { createActivity } from "./activity";
+import { createActivity, type ActivityPort } from "./activity";
+import { teams } from "./teams";
+import { createSubagentActivity } from "./subagentActivity";
 import { archive } from "./archive";
 import { applyGrouping } from "./organization";
 import { activityReadOnly } from "./activitySource";
-import { compactRows, detailTab, page, selected, selectedKey, setCompactRows, setDetailTab, setSelectedKey, subagentOpen } from "./ui";
+import { compactRows, detailTab, page, selected, selectedKey, setCompactRows, setDetailTab, setReadSelectionKey, setSelectedKey, subagentOpen } from "./ui";
 import { startScreens } from "./screens";
 import { documentVisibility } from "./visibility";
 import { processes, trackFollow, trackShown } from "./processes";
@@ -27,7 +30,35 @@ import type { Batch, ComposerEvent } from "../types";
 // without an archive id); store/archiveActivity.ts reads its recorded
 // Activity.
 
-export const activity = createActivity(activityPort);
+/**
+ * The Activity port of the two live follows: the selected session's and the
+ * Team tab's coordinator (task 9). Both may show one session in turn, and the
+ * desktop runs follow and unfollow as they come, possibly out of order: an
+ * unfollow waits while the other follow still shows that session, and a
+ * follow waits for that session's unfollow in flight.
+ */
+const unfollowing = new Map<string, Promise<void>>();
+function sharedPort(others: () => readonly (string | undefined)[]): ActivityPort {
+  return {
+    follow: (request) => {
+      const pending = unfollowing.get(rowId(request.computer, request.key));
+      return pending ? pending.then(() => activityPort.follow(request)) : activityPort.follow(request);
+    },
+    unfollow: (computer, key) => {
+      const id = rowId(computer, key);
+      if (others().includes(id)) return Promise.resolve();
+      const done: Promise<void> = activityPort.unfollow(computer, key).catch(() => {}).finally(() => { if (unfollowing.get(id) === done) unfollowing.delete(id); });
+      unfollowing.set(id, done);
+      return done;
+    },
+  };
+}
+
+export const activity = createActivity(sharedPort(() => [coordinatorActivity.target()?.id, designerActivity.target()?.id]));
+/** The Team tab's coordinator conversation, when the coordinator is not the selected session. */
+export const coordinatorActivity = createActivity(sharedPort(() => [activity.target()?.id, designerActivity.target()?.id]));
+/** Task #44: the Team designer's conversation on its page, when it is not the selected session. */
+export const designerActivity = createActivity(sharedPort(() => [activity.target()?.id, coordinatorActivity.target()?.id]));
 bindActivity(activity);
 bindModelNotice((message) => notify("error", message, true));
 bindSelection(() => ({ key: selectedKey(), subagent: subagentOpen() }));
@@ -36,15 +67,39 @@ bindForkSession({
   terminal: () => { terminal.opened(); setDetailTab("terminal"); },
 });
 
+/** The selected child's own bounded, read-only inspection page. */
+export const subagentActivity = createRoot(() => {
+  const store = createSubagentActivity({
+    read: (target) => inspectSubagentActivity(
+      { computer: target.computer, name: target.name, run_id: target.runId, conversation_id: target.conversationId },
+      target.archiveId,
+      target.agentId,
+    ),
+    showing: () => page() === "sessions" && !documentVisibility.hidden(),
+    online: (computer) => !computerOffline(computer),
+  });
+  createEffect(() => {
+    const row = selected(), agentId = subagentOpen();
+    const target = row && agentId && row.runId && row.conversationId ? {
+      id: row.key, computer: row.computer, name: row.name, runId: row.runId, conversationId: row.conversationId,
+      archiveId: row.archiveId ?? null, agentId,
+    } : undefined;
+    untrack(() => store.follow(target));
+  });
+  return store;
+});
+
 /** Applies one batch from the bridge: its rows and their grouping are one reactive update. */
 export function receive(b: Batch) {
   batch(() => {
+    if (b.desktop_service) desktopService.apply(b.desktop_service);
     applyBatch(b);
     applyGrouping(b);
     archive.applyGroups(b.groups ?? []);
   });
   observeMarks(b);
-  if (b.activity.length) activity.applyActivity(b.activity);
+  if (b.activity.length) { activity.applyActivity(b.activity); coordinatorActivity.applyActivity(b.activity); designerActivity.applyActivity(b.activity); }
+  if (b.teams?.length) teams.apply(b.teams);
   if (b.tasks?.length) tasks.apply(b.tasks);
   if (b.processes_view) processes.apply(b.processes_view);
   if (b.composer) composer.receive(b.composer);
@@ -61,27 +116,31 @@ function composerEvent(e: ComposerEvent) {
 }
 
 createRoot(() => {
-  createEffect(on(() => {
-    const s = selected();
-    return s ? `${s.key}\n${s.name}` : undefined;
-  }, () => {
-    const s = selected();
-    activity.follow(s && !activityReadOnly(s.key) ? { id: s.key, computer: s.computer, key: s.catalogKey, name: s.name, runId: s.runId, conversationId: s.conversationId } : undefined);
-  }));
+  // Another selection lets the row whose reply was just read leave the
+  // filtered list (Qt's selectSession and selectCreation clear m_readSelectionKey).
+  createEffect(on(selectedKey, () => { setReadSelectionKey(undefined); }, { defer: true }));
   // The selected session's composer. A rename keeps the catalog key, so Rust
   // moves its draft to the new name. An archived row opens its own editable
   // draft too; only its recorded Activity stays read-only (Qt selectSession).
   createEffect(on(() => {
     const s = selected();
-    return s ? `${s.computer}\n${s.catalogKey}\n${s.name}\n${s.state === "archived" ? s.archiveId ?? "" : ""}` : undefined;
+    return s ? JSON.stringify([s.computer, s.catalogKey, s.name, s.state === "archived" ? s.archiveId ?? "" : "", subagentOpen(), s.conversationId ?? ""]) : undefined;
   }, (identity) => {
-    const s = selected();
-    void composer.open(identity && s ? { computer: s.computer, key: s.catalogKey, name: s.name, archive_id: s.state === "archived" ? s.archiveId ?? null : null } : undefined);
+    const s = selected(), child = subagentOpen();
+    const opened = composer.open(identity && s ? {
+      computer: s.computer, key: s.catalogKey, name: s.name, archive_id: s.state === "archived" ? s.archiveId ?? null : null,
+      subagent: child ? { agent_id: child, parent_conversation_id: s.conversationId ?? "" } : undefined,
+    } : undefined);
+    // The first new-run frame may be its only state. Rust must bind the
+    // composer's followed key before that frame can reach its observer.
+    // Display/routing moves immediately; only the original subscribe waits.
+    activity.follow(s && !activityReadOnly(s.key) ? { id: s.key, computer: s.computer, key: s.catalogKey, name: s.name, runId: s.runId, conversationId: s.conversationId } : undefined, opened);
   }));
   // The detail tab that shows: behind Terminal a failed read waits Qt's
   // background interval (Settings > Processes), which Rust reads when told.
   createEffect(on(() => [detailTab(), num("processes/backgroundSeconds"), num("processes/activeSeconds")] as const, ([tab]) => {
-    void composerTab(tab === "taskview" ? "native" : tab).catch(() => {});
+    // The Team tab shows the coordinator's conversation (and, for the lead, its composer).
+    void composerTab(tab === "taskview" ? "native" : tab === "team" ? "activity" : tab).catch(() => {});
   }));
 });
 

@@ -125,6 +125,23 @@ fn team_items(team: &Team, now: f64, out: &mut Vec<Value>) {
                 found["member_id"] = attention["member_id"].clone();
                 out.push(found);
             }
+            // The lead's session stopped: the team waits for the owner to resume it.
+            "lead_stopped" => {
+                let member = attention["member"].as_str().unwrap_or_default().to_owned();
+                let mut found = item(team, "lead_stopped", &member, summary, at, "resume_lead");
+                found["member"] = json!(member);
+                found["member_id"] = attention["member_id"].clone();
+                out.push(found);
+            }
+            // Only the member's Terminal takes this answer: the button opens the
+            // team, and the title says where to answer.
+            "permission_terminal" => {
+                let member = attention["member"].as_str().unwrap_or_default().to_owned();
+                let mut found = item(team, "permission_escalated", &format!("{member}-terminal"), summary, at, "open_terminal");
+                found["member"] = json!(member);
+                found["member_id"] = attention["member_id"].clone();
+                out.push(found);
+            }
             // N17: a replan pauses the team for the owner's word on the proposal.
             "replan" => {
                 let finding = attention["finding"].as_str().unwrap_or_default();
@@ -295,9 +312,18 @@ mod tests {
         finished.tasks[0].status = TaskStatus::Accepted;
         finished.tasks[0].attempts.push(Attempt { n: 1, state: AttemptState::Reported, decided_at: Some(6000.0), ..Default::default() });
 
-        // Nothing waits for the owner here: a running team at work, a stopped
-        // team and an archived one.
-        let quiet = team("t-quiet", TeamStatus::Running);
+        // Nothing waits for the owner here: a running team at work, an interim
+        // report on an open attempt, a stopped team and an archived one.
+        let mut quiet = team("t-quiet", TeamStatus::Running);
+        quiet.tasks[0].status = TaskStatus::InProgress;
+        quiet.tasks[0].attempts.push(Attempt {
+            n: 1,
+            id: "a1".into(),
+            member: "dev".into(),
+            state: AttemptState::Delivered,
+            interim: Some(Report { text: "Half the API is in".into(), at: 7000.0, ..Default::default() }),
+            ..Default::default()
+        });
         let mut stopped = team("t-stop", TeamStatus::Stopped);
         stopped.tasks[0].hold = Some(Hold { by: "You".into(), at: 9000.0, ..Default::default() });
 
@@ -308,6 +334,7 @@ mod tests {
             ["team_finished", "task_waits_owner", "owner_word_asked", "owner_word_asked", "permission_escalated", "report_escalated", "phase_draft", "plan_draft"],
             "{list:#?}"
         );
+        assert!(!list.iter().any(|item| item["title"].as_str().unwrap_or_default().contains("Half the API is in")), "an interim report is not the owner's: {list:#?}");
         for item in &list {
             let team = item["team"].as_str().unwrap();
             assert_eq!(item["team_name"], format!("Team {team}"));

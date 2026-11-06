@@ -224,6 +224,9 @@ fn a_build_runs_in_the_snapshot_an_unchanged_tree_once_and_tells_the_other_membe
 #[test]
 fn the_lead_proposes_the_broker_for_a_shared_folder_and_the_owners_allow_sets_it() {
     let dir = project();
+    // A folder that builds (feedback 19: pages and scripts get no offer).
+    fs::write(dir.path().join("Makefile"), "all:
+").unwrap();
     let mut team = team_in(dir.path());
     // Two members in one folder: the lead's item names the switch card.
     let items = crate::state::teams::inbox::items(&team);
@@ -381,7 +384,17 @@ fn a_shared_build_waits_for_the_others_edits_then_runs_in_the_folder_itself() {
     crate::state::teams::templates::settings_override(None);
     assert_eq!(first.exit, Some(0), "{first:?}");
     assert!(first.tail.contains("built build in the shared folder itself (no copy)"), "{}", first.tail);
-    assert!(first.tail.contains("waited 1 s") && first.tail.contains("included unfinished changes of dev2 (Gameplay) (src/b.c)"), "{}", first.tail);
+    // The machine's speed may round the wait up: it waited at least the 1 s
+    // ready delay for the other member's edits.
+    let waited: f64 = first
+        .tail
+        .split("waited ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or_default();
+    assert!(waited >= 1.0, "it waited for the edits: {}", first.tail);
+    assert!(first.tail.contains("included unfinished changes of dev2 (Gameplay) (src/b.c)"), "{}", first.tail);
     // It ran in the folder: its output is there, and no snapshot was made.
     assert!(root.join("built.txt").exists());
     assert!(!member_dir(root, "dev").join("tree").exists());
@@ -390,7 +403,13 @@ fn a_shared_build_waits_for_the_others_edits_then_runs_in_the_folder_itself() {
     assert!(unready(root, &team, &dev).is_empty());
     assert!(unready(root, &team, &dev2).is_empty(), "dev's own build marked dev ready");
     crate::state::teams::templates::settings_override(Some(templates.path().join("templates.json")));
-    let second = run(&team, &dev, root, "build", &json!({}), &config, Duration::from_secs(60)).unwrap();
+    // The readiness checks above passed; with no ready window the second build
+    // must not wait at all (a bounded, timing-independent assertion). A dev-
+    // owned tracked file makes it a new build with its own timeline entry.
+    fs::write(root.join("a.txt"), "dev changed\n").unwrap();
+    let immediate = Config { ready_wait: Duration::ZERO, ..config.clone() };
+    crate::state::teams::templates::settings_override(Some(templates.path().join("templates.json")));
+    let second = run(&team, &dev, root, "build", &json!({}), &immediate, Duration::from_secs(60)).unwrap();
     crate::state::teams::templates::settings_override(None);
     assert!(!second.tail.contains("waited") && !second.tail.contains("unfinished"), "{}", second.tail);
     // A later write by dev2 makes it unready again.
@@ -401,4 +420,19 @@ fn a_shared_build_waits_for_the_others_edits_then_runs_in_the_folder_itself() {
     let view = builds_view(&team, crate::state::now());
     let groups = view["folders"][0]["build_folders"].as_array().unwrap();
     assert!(groups.iter().any(|group| group["name"] == "." && group["timeline"].as_array().is_some_and(|items| items.len() == 2)), "{view}");
+}
+
+/// Owner feedback 2026-11-04 (19): pages and scripts build nothing, so the
+/// shared folder gets no broker offer; a project build file does.
+#[test]
+fn only_a_folder_that_builds_is_offered_the_broker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<p>slides</p>").unwrap();
+    std::fs::write(dir.path().join("render.py"), "print(1)").unwrap();
+    assert!(!super::builds(dir.path()));
+    std::fs::write(dir.path().join("Game.uproject"), "{}").unwrap();
+    assert!(super::builds(dir.path()));
+    let cargo = tempfile::tempdir().unwrap();
+    std::fs::write(cargo.path().join("Cargo.toml"), "[package]").unwrap();
+    assert!(super::builds(cargo.path()));
 }

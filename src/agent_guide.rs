@@ -14,6 +14,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("team-lead", include_str!("agent_guide/team-lead.md")),
     ("team-custom", include_str!("agent_guide/team-custom.md")),
     ("team-draft", include_str!("agent_guide/team-draft.md")),
+    ("team-input", include_str!("agent_guide/team-input.md")),
     ("team-tree", include_str!("agent_guide/team-tree.md")),
     ("team-run", include_str!("agent_guide/team-run.md")),
     ("team-safe", include_str!("agent_guide/team-safe.md")),
@@ -27,7 +28,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("stop", include_str!("agent_guide/stop.md")),
     ("tasks", include_str!("agent_guide/tasks.md")),
 ];
-const USAGE: &str = "usage: hgs guide [send|wait|team|team-tests|team-lead|team-custom|team-draft|team-tree|team-run|team-safe|team-propose|team-broker|run|tests|designer|launch|stop|tasks]";
+const USAGE: &str = "usage: hgs guide [send|wait|team|team-tests|team-lead|team-custom|team-draft|team-input|team-tree|team-run|team-safe|team-propose|team-broker|run|tests|designer|launch|stop|tasks]";
 
 pub(crate) fn dispatch(args: &[String]) -> Result<i32> {
     let text = match args {
@@ -119,6 +120,14 @@ mod tests {
         assert!(custom.contains("keep_assignees (off)"));
     }
 
+    /// Owner (2026-11-01): a member's question goes through `hgs team ask`,
+    /// never a report.
+    #[test]
+    fn the_member_page_sends_a_question_through_team_ask() {
+        let team = TOPICS.iter().find(|(name, _)| *name == "team").unwrap().1;
+        assert!(team.contains("A question goes through hgs team ask, never a report"), "{team}");
+    }
+
     /// U38: the lead protocol names the profile, the top three losses and the
     /// per-role numbers, and says unknown is never zero.
     #[test]
@@ -176,9 +185,26 @@ mod tests {
         assert!(lead.contains("Accepted phase not started"), "{lead}");
         assert!(lead.contains("return-to-draft re-approves"), "{lead}");
         assert!(lead.contains("pause-phase {phase, reason}"), "{lead}");
-        assert!(lead.contains("accept-phase (owner's word)"), "{lead}");
+        assert!(lead.contains("accept-phase (a card)"), "{lead}");
         let tree = TOPICS.iter().find(|(name, _)| *name == "team-tree").unwrap().1;
         assert!(tree.contains("hgs team sub-lead"), "{tree}");
+    }
+
+    /// Task #21 (owner, 2026-11-05): the lead proposes every owner-gated change
+    /// as a card and never asks the owner to type a phrase.
+    #[test]
+    fn the_lead_proposes_owner_gates_and_never_asks_for_a_phrase() {
+        let lead = TOPICS.iter().find(|(name, _)| *name == "team-lead").unwrap().1;
+        assert!(lead.contains("Owner gates are cards") && lead.contains("Never ask the owner to type a phrase"), "{lead}");
+        assert!(!lead.contains("owner_word") && !lead.contains("owner's sentence"), "{lead}");
+        let propose = TOPICS.iter().find(|(name, _)| *name == "team-propose").unwrap().1;
+        assert!(propose.contains("Never ask the owner to type a phrase"), "{propose}");
+        for kind in crate::state::teams::ops::OWNER_OPS {
+            assert!(propose.contains(kind), "team-propose omits {kind}");
+        }
+        for kind in ["\"relaunch\"", "\"iron-rules\"", "base_branch", "full_tests", "max_members"] {
+            assert!(propose.contains(kind), "team-propose omits {kind}");
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ mod model;
 mod replica;
 mod service;
 mod store;
+pub(crate) use store::read_snapshot as read_catalog_snapshot;
 mod transport;
 
 use crate::{cli, config::Config};
@@ -162,6 +163,16 @@ pub(crate) fn local_node_id(config: &Config) -> Result<String> {
     );
     store.save()?;
     Ok(store.data.node_id.clone())
+}
+
+/// Validate an already admitted existing catalog without loading, initializing
+/// or saving a store. The receipt reader owns its bounded private file read.
+pub(crate) fn existing_node_id(bytes: &[u8]) -> Result<String> {
+    let data: store::Store = serde_json::from_slice(bytes)?;
+    data.catalog.validate()?;
+    let id = uuid::Uuid::parse_str(&data.node_id)?;
+    ensure!(!id.is_nil() && id.to_string() == data.node_id, "invalid persisted machine identity");
+    Ok(data.node_id)
 }
 
 fn input() -> Result<Value> {
